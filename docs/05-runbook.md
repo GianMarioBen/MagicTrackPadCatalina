@@ -31,18 +31,43 @@ quel report non esiste.
 
 ## La regola che governa tutto
 
-Misurata sperimentalmente: **IOHIDFamily consegna un report solo se la sua
-lunghezza combacia esattamente con quella dichiarata nel descriptor.**
+Misurata sperimentalmente, provando tutte le combinazioni:
 
-| Dichiarato | Ricevuto | Esito |
-|---|---|---|
-| 94 byte (10 contatti) | 13 byte (1 dito) | scartati tutti, zero report |
-| 13 byte (1 contatto)  | 13 byte (1 dito) | 1193 report consegnati |
+**IOHIDFamily scarta i report piu' corti di quanto dichiarato, e tronca
+quelli piu' lunghi.**
 
-Non riempie i report piu' corti del dichiarato. Questo e' il vincolo centrale
-del progetto, perche' la lunghezza dei report multitouch **varia col numero di
-dita**: 4 + 9n byte, cioe' 13 con un dito, 22 con due, 31 con tre. Il
-descriptor puo' dichiararne una sola.
+| Dichiarato | report da 13 (1 dito) | da 22 (2 dita) | da 31 (3 dita) |
+|---|---|---|---|
+| 94 byte | scartato | scartato | scartato |
+| 13 byte | consegnato | troncato a 13 | troncato a 13 |
+| 22 byte | scartato | consegnato | troncato a 22 |
+
+Il descriptor puo' dichiarare una lunghezza sola, ma quella dei report
+multitouch **varia col numero di dita** (4 + 9n byte). Le due cose insieme
+producono un vincolo che non si aggira dal lato del descriptor:
+
+- **dichiarando 13** arriva sempre qualcosa, ma solo il **primo contatto**:
+  puntatore si', gesture a piu' dita no;
+- **dichiarando 22** arrivano **due contatti** quando ci sono almeno due
+  dita, ma con un dito solo non arriva niente: scroll si', puntatore no.
+
+Verificato sui tracking id secondo per secondo. Con 13 byte dichiarati e due
+o tre dita appoggiate si vede sempre e solo un id alla volta; con 22 byte se
+ne vedono due simultanei e stabili.
+
+## Conseguenza pratica
+
+Il bridge lavora quindi a **13 byte**, con un contatto solo, e ottiene lo
+scroll e il click secondario per altra via: scroll lungo i bordi e click
+secondario nell'angolo, invece che a due dita. Le gesture a tre dita non
+sono raggiungibili per questa strada.
+
+Per il multitouch pieno servirebbe sapere se il dispositivo puo' essere
+configurato per emettere report a lunghezza fissa. Il canale comandi vendor
+c'e' (feature report 0x55, 64 byte, dichiarato nel descriptor originale), ma
+il suo protocollo non e' documentato. La via per scoprirlo sarebbe catturare
+con PacketLogger la sequenza di inizializzazione che un macOS recente invia
+allo stesso dispositivo, dove il trackpad funziona nativamente.
 
 ## Il principio
 
