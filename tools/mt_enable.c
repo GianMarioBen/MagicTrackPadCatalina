@@ -140,6 +140,12 @@ static void on_report(void *ctx, IOReturn res, void *sender,
     int mt = fingers >= 0;
     if (mt) f->multitouch_reports++;
 
+    /* Il mouse di compatibilita' e' il report 0x02 da 8 byte: con --terse
+     * lo si conta e basta, per non sommergere il terminale. */
+    int is_mouse = (reportID == 0x02 && len == 8);
+    if (is_mouse) g_mouse_reports++;
+    if (opt_terse && is_mouse) return;
+
     char tag[24];
     if (mt) snprintf(tag, sizeof tag, " MT %dd", fingers);
     else    snprintf(tag, sizeof tag, "      ");
@@ -196,6 +202,9 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--listen")) opt_listen_only = 1;
         else if (!strcmp(argv[i], "--desc")) opt_desc = 1;
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc) opt_secs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seize")) opt_seize = 1;
+        else if (!strcmp(argv[i], "--repeat")) opt_repeat = 1;
+        else if (!strcmp(argv[i], "--terse")) opt_terse = 1;
         else { fprintf(stderr, "opzione sconosciuta: %s\n", argv[i]); return 2; }
     }
 
@@ -250,7 +259,9 @@ int main(int argc, char **argv) {
     printf("=== Apertura ===\n");
     for (int i = 0; i < g_nif; i++) {
         Iface *f = &g_if[i];
-        IOReturn r = IOHIDDeviceOpen(f->dev, kIOHIDOptionsTypeNone);
+        IOReturn r = IOHIDDeviceOpen(f->dev, opt_seize
+                                     ? kIOHIDOptionsTypeSeizeDevice
+                                     : kIOHIDOptionsTypeNone);
         f->opened = (r == kIOReturnSuccess);
         printf("  [%d] open: 0x%08X %s\n", i, r, ret_name(r));
         if (f->opened)
@@ -267,10 +278,28 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("=== Ascolto per %.0f secondi — muovi le dita sul trackpad ===\n\n",
+    printf("=== Ascolto per %.0f secondi — muovi le dita sul trackpad ===\n",
            opt_secs);
+    printf("    >>> guarda se il PUNTATORE SI FERMA: e' il segnale che il\n"
+           "        cambio di modo e' avvenuto <<<\n\n");
     fflush(stdout);
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, opt_secs, false);
+
+    if (opt_repeat) {
+        double spent = 0;
+        while (spent < opt_secs) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false);
+            spent += 2.0;
+            for (int i = 0; i < g_nif; i++)
+                if (g_if[i].opened) {
+                    const uint8_t *cmd = g_if[i].bluetooth ? ENABLE_BT : ENABLE_USB;
+                    size_t l = g_if[i].bluetooth ? sizeof ENABLE_BT : sizeof ENABLE_USB;
+                    IOHIDDeviceSetReport(g_if[i].dev, kIOHIDReportTypeFeature,
+                                         cmd[0], cmd, (CFIndex)l);
+                }
+        }
+    } else {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, opt_secs, false);
+    }
 
     printf("\n=== Riepilogo ===\n");
     int total = 0, total_mt = 0;
@@ -283,6 +312,11 @@ int main(int argc, char **argv) {
         total_mt += g_if[i].multitouch_reports;
     }
     printf("\n  totale: %d report, %d multitouch\n", total, total_mt);
+    printf("  di cui mouse di compatibilita' (0x02 da 8 byte): %d\n",
+           g_mouse_reports);
+    if (g_mouse_reports > 0 && total_mt == 0)
+        printf("\n  Il mouse di compatibilita' continua a trasmettere: il\n"
+               "  dispositivo NON e' passato in modalita' multitouch.\n");
 
     if (total == 0)
         printf("\n  Zero report ovunque: o il kernel li scarta, o un altro\n"
