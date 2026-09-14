@@ -98,6 +98,11 @@ DESC_SIGNATURES = (
     b"\x05\x0D\x09\x05\xA1\x01",   # Digitizer / Touch Pad
 )
 
+# ProductID dei due modelli. Sono identici nelle funzioni: cambia il
+# connettore, e cambia il fatto che Catalina conosce solo il secondo.
+PID_USBC      = 0x0324   # 804, Magic Trackpad USB-C
+PID_LIGHTNING = 0x0265   # 613, Magic Trackpad 2 Lightning
+
 
 def die(msg, code=1):
     print("errore: " + msg, file=sys.stderr)
@@ -355,6 +360,124 @@ def cmd_watch(args):
             time.sleep(5)
 
 
+# ---------------------------------------------------------------------
+# Travestimento del ProductID
+# ---------------------------------------------------------------------
+
+class PidField:
+    """Un punto del plist dove compare il ProductID, con come riscriverlo."""
+
+    def __init__(self, path, container, key, value, archive=None, blob_key=None):
+        self.path = path
+        self.container = container
+        self.key = key
+        self.value = value
+        self.archive = archive          # archivio annidato, se il campo e' dentro
+        self.blob_key = blob_key        # chiave del blob che lo contiene
+
+    def write(self, new_value):
+        self.container[self.key] = new_value
+        if self.archive is not None:
+            # il campo sta dentro un archivio: va riserializzato nel blob
+            self.blob_container[self.blob_key] = plistlib.dumps(
+                self.archive, fmt=plistlib.FMT_BINARY)
+        self.value = new_value
+
+
+def find_pid_fields(data, old_pid, addr=None):
+    """Cerca le chiavi ProductID del dispositivo, anche dentro gli archivi."""
+    want = norm_addr(addr) if addr else None
+    found = []
+
+    def device_matches(node, path):
+        if not want:
+            return True
+        if any(norm_addr(seg) == want for seg in path):
+            return True
+        if isinstance(node, dict):
+            da = node.get("DeviceAddress")
+            if isinstance(da, str) and norm_addr(da) == want:
+                return True
+        return False
+
+    def visit(node, path, ok, archive, blob_container, blob_key):
+        if isinstance(node, dict):
+            ok = ok or device_matches(node, path)
+            if ok and node.get("ProductID") == old_pid:
+                f = PidField("/".join(path) + "/ProductID", node, "ProductID",
+                             old_pid, archive, blob_key)
+                f.blob_container = blob_container
+                found.append(f)
+            for k, v in node.items():
+                if isinstance(v, (bytes, bytearray)) and bytes(v[:8]) == b"bplist00":
+                    try:
+                        inner = plistlib.loads(bytes(v))
+                    except Exception:
+                        continue
+                    visit(inner, path + (str(k), "<archivio>"), ok,
+                          inner, node, k)
+                elif not isinstance(v, (bytes, bytearray)):
+                    visit(v, path + (str(k),), ok, archive,
+                          blob_container, blob_key)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if not isinstance(v, (bytes, bytearray)):
+                    visit(v, path + ("[%d]" % i,), ok, archive,
+                          blob_container, blob_key)
+
+    visit(data, (), False, None, None, None)
+    return found
+
+
+def cmd_spoof_pid(args):
+    old, new = args.from_pid, args.to_pid
+    data = load_plist()
+    fields = find_pid_fields(data, old, args.addr)
+
+    if not fields:
+        print("Nessun ProductID = %d (0x%04X) trovato%s."
+              % (old, old, " per %s" % args.addr if args.addr else ""))
+        print("Il dispositivo e' gia' travestito? Prova --show-pid.")
+        return False
+
+    print("ProductID da cambiare: %d (0x%04X) -> %d (0x%04X)"
+          % (old, old, new, new))
+    for f in fields:
+        print("  %s%s" % (f.path,
+              "   (dentro un archivio annidato)" if f.archive is not None else ""))
+
+    backup = PLIST + BACKUP_SUFFIX
+    if not os.path.exists(backup):
+        shutil.copy2(PLIST, backup)
+        print("\nBackup: %s" % backup)
+
+    for f in fields:
+        f.write(new)
+    save_plist(data)
+
+    print("\nScritto in %d punti." % len(fields))
+    print("\nOra:")
+    print("  sudo killall -9 cfprefsd bluetoothd")
+    print("  spegni e riaccendi il trackpad e aspetta che si riconnetta")
+    print("  ioreg -r -c AppleHSBluetoothDevice -l | head -40")
+    print("\nSe compare AppleHSBluetoothDevice, Catalina ha accettato il")
+    print("travestimento e il trackpad e' nativo: niente bridge, niente patch")
+    print("del descriptor, gesture e Force Touch come su un Mac recente.")
+    print("\nPer tornare indietro:  sudo %s --restore" % sys.argv[0])
+    return True
+
+
+def cmd_show_pid(args):
+    data = load_plist()
+    for pid, nome in ((PID_USBC, "USB-C"), (PID_LIGHTNING, "Lightning")):
+        fields = find_pid_fields(data, pid, args.addr)
+        if fields:
+            print("ProductID %d (0x%04X) — %s : %d punti"
+                  % (pid, pid, nome, len(fields)))
+            for f in fields:
+                print("  %s" % f.path)
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Dichiara a macOS il report multitouch 0x31.")
@@ -363,6 +486,15 @@ def main():
     p.add_argument("--add-multitouch", action="store_true",
                    help="aggiunge la dichiarazione del report 0x31")
     p.add_argument("--restore", action="store_true", help="ripristina il backup")
+    p.add_argument("--show-pid", action="store_true",
+                   help="mostra dove compare il ProductID del dispositivo")
+    p.add_argument("--spoof-pid", action="store_true",
+                   help="fa dichiarare al dispositivo il ProductID del modello "
+                        "Lightning, che Catalina supporta nativamente")
+    p.add_argument("--from-pid", type=lambda x: int(x, 0), default=PID_USBC,
+                   metavar="N", help="ProductID attuale (default 0x0324)")
+    p.add_argument("--to-pid", type=lambda x: int(x, 0), default=PID_LIGHTNING,
+                   metavar="N", help="ProductID da dichiarare (default 0x0265)")
     p.add_argument("--watch", action="store_true",
                    help="riapplica la patch se viene sovrascritta")
     p.add_argument("--addr", metavar="BD_ADDR",
@@ -375,11 +507,16 @@ def main():
                         % (DEFAULT_CONTACTS, 4 + 9 * DEFAULT_CONTACTS))
     args = p.parse_args()
 
-    if (args.add_multitouch or args.restore) and os.geteuid() != 0:
+    if (args.add_multitouch or args.restore or args.spoof_pid) \
+            and os.geteuid() != 0:
         die("serve sudo per scrivere %s" % PLIST)
 
     if args.restore:
         cmd_restore(args)
+    elif args.show_pid:
+        cmd_show_pid(args)
+    elif args.spoof_pid:
+        cmd_spoof_pid(args)
     elif args.watch:
         if not args.add_multitouch:
             die("--watch richiede --add-multitouch")
@@ -394,3 +531,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
