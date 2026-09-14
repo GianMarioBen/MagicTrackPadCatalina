@@ -20,6 +20,8 @@ typedef const struct __CFNumber     *CFNumberRef;
 typedef const struct __CFAllocator  *CFAllocatorRef;
 typedef struct __CFDictionary       *CFMutableDictionaryRef;
 typedef struct __CFRunLoop          *CFRunLoopRef;
+typedef const struct __CFDictionary  *CFDictionaryRef;
+typedef const struct __CFBoolean     *CFBooleanRef;
 
 typedef struct { CFIndex location, length; } CFRange;
 typedef struct { CFIndex version; void *retain, *release, *copyDescription, *equal, *hash; } CFDictionaryKeyCallBacks;
@@ -51,6 +53,9 @@ CFMutableDictionaryRef CFDictionaryCreateMutable(CFAllocatorRef, CFIndex,
     const CFDictionaryKeyCallBacks *, const CFDictionaryValueCallBacks *);
 void CFDictionarySetValue(CFMutableDictionaryRef, const void *, const void *);
 void CFRelease(CFTypeRef);
+extern const CFBooleanRef kCFBooleanTrue;
+CFDictionaryRef CFDictionaryCreate(CFAllocatorRef, const void **, const void **,
+    CFIndex, const CFDictionaryKeyCallBacks *, const CFDictionaryValueCallBacks *);
 CFRunLoopRef CFRunLoopGetCurrent(void);
 void CFRunLoopRun(void);
 int  CFRunLoopRunInMode(CFStringRef, CFTimeInterval, Boolean);

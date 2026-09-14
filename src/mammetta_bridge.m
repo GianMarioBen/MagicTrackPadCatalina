@@ -76,9 +76,10 @@ static struct {
     int    natural_scroll;
     int    tap_to_click;
     int    edge_scroll;     /* scroll di bordo, per la modalita' a un contatto */
+    int    diag;            /* riga di stato una volta al secondo */
     double pointer_speed;
     double scroll_speed;
-} opt = { 0, 0, 1, 1, 1, 1.0, 1.0 };
+} opt = { 0, 0, 1, 1, 1, 0, 1.0, 1.0 };
 
 /* ------------------------------------------------------------------ */
 /* Decodifica                                                         */
@@ -142,6 +143,11 @@ static int decode_report(const uint8_t *data, size_t len,
 static CGPoint g_cursor;
 static int     g_cursor_valid = 0;
 
+/* Contatori per la diagnostica: servono a distinguere "non arrivano dati"
+ * da "arrivano dati ma gli eventi non vengono consegnati a nessuno". */
+static long g_events_posted = 0;
+static long g_reports_seen  = 0;
+
 static CGRect desktop_bounds(void) {
     CGDirectDisplayID ids[16];
     uint32_t count = 0;
@@ -193,6 +199,7 @@ static void post_move(double dx, double dy, int dragging) {
     CGEventSetDoubleValueField(e, kCGMouseEventDeltaY, my);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_scroll(double dx, double dy, int phase) {
@@ -213,6 +220,7 @@ static void post_scroll(double dx, double dy, int phase) {
     CGEventSetIntegerValueField(e, kCGScrollWheelEventScrollPhase, phase);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_button(CGEventType type, CGMouseButton button) {
@@ -222,6 +230,7 @@ static void post_button(CGEventType type, CGMouseButton button) {
     if (!e) return;
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_click(CGMouseButton button) {
@@ -532,7 +541,25 @@ static void on_report(void *ctx, IOReturn res, void *sender,
         printf("Report multitouch in arrivo. Il bridge e' operativo.\n\n");
         fflush(stdout);
     }
+    g_reports_seen++;
     handle_contacts(contacts, count, button);
+
+    if (opt.diag) {
+        static CFAbsoluteTime last = 0;
+        static long r0 = 0, e0 = 0;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - last >= 1.0) {
+            int down = 0;
+            for (int i = 0; i < count; i++) if (contacts[i].down) down++;
+            printf("  report/s %-4ld  dita %d  %-22s  eventi/s %-4ld  "
+                   "accessibilita' %s\n",
+                   g_reports_seen - r0, down, gesture_name(st.gesture),
+                   g_events_posted - e0,
+                   AXIsProcessTrusted() ? "ok" : "MANCANTE");
+            fflush(stdout);
+            last = now; r0 = g_reports_seen; e0 = g_events_posted;
+        }
+    }
 }
 
 static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
@@ -618,6 +645,8 @@ static void usage(const char *prog) {
 "      --classic-scroll   direzione di scroll classica (non naturale)\n"
 "      --no-tap           disabilita il tap-to-click\n"
 "      --no-edge-scroll   disabilita lo scroll lungo i bordi\n"
+"      --diag             riga di stato al secondo, per capire dove si\n"
+"                         perde il segnale\n"
 "      --pointer N        velocita' del puntatore (default 1.0)\n"
 "      --scroll N         velocita' dello scroll  (default 1.0)\n"
 "  -h, --help             questo messaggio\n"
@@ -649,6 +678,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--classic-scroll")) opt.natural_scroll = 0;
         else if (!strcmp(a, "--no-tap"))         opt.tap_to_click = 0;
         else if (!strcmp(a, "--no-edge-scroll"))  opt.edge_scroll = 0;
+        else if (!strcmp(a, "--diag"))            opt.diag = 1;
         else if (!strcmp(a, "--pointer") && i + 1 < argc) opt.pointer_speed = atof(argv[++i]);
         else if (!strcmp(a, "--scroll")  && i + 1 < argc) opt.scroll_speed  = atof(argv[++i]);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -656,11 +686,29 @@ int main(int argc, char **argv) {
     }
 
     if (!opt.no_events && !AXIsProcessTrusted()) {
+        /* Chiedere il permesso apre direttamente il pannello di sistema:
+         * molto meglio che limitarsi ad avvisare, perche' senza questo
+         * permesso gli eventi vengono generati e buttati via in silenzio. */
+        const void *keys[] = { kAXTrustedCheckOptionPrompt };
+        const void *vals[] = { kCFBooleanTrue };
+        CFDictionaryRef o = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1,
+                                &kCFTypeDictionaryKeyCallBacks,
+                                &kCFTypeDictionaryValueCallBacks);
+        AXIsProcessTrustedWithOptions(o);
+        if (o) CFRelease(o);
+
         fprintf(stderr,
-            "Il processo non e' abilitato all'Accessibilita'.\n"
-            "Preferenze di Sistema -> Sicurezza e Privacy -> Privacy ->\n"
-            "Accessibilita': aggiungi il Terminale (o questo binario).\n"
-            "Senza, gli eventi vengono generati ma non consegnati.\n\n");
+            "\n**********************************************************\n"
+            "  MANCA IL PERMESSO DI ACCESSIBILITA'\n"
+            "\n"
+            "  Senza, il bridge legge il trackpad e decodifica tutto, ma\n"
+            "  gli eventi che genera non vengono consegnati a nessuno:\n"
+            "  il puntatore resta fermo e sembra che non funzioni niente.\n"
+            "\n"
+            "  Preferenze di Sistema -> Sicurezza e Privacy -> Privacy\n"
+            "  -> Accessibilita': aggiungi il Terminale e spunta la casella.\n"
+            "  Poi CHIUDI E RIAPRI il Terminale, e rilancia il bridge.\n"
+            "**********************************************************\n\n");
     }
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,

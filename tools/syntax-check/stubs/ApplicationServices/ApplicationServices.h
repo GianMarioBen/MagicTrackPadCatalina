@@ -46,4 +46,6 @@ void CGEventSetIntegerValueField(CGEventRef, CGEventField, int64_t);
 void CGEventSetFlags(CGEventRef, CGEventFlags);
 void CGEventPost(void *, CGEventRef);
 Boolean AXIsProcessTrusted(void);
+extern const CFStringRef kAXTrustedCheckOptionPrompt;
+Boolean AXIsProcessTrustedWithOptions(CFDictionaryRef);
 #endif
