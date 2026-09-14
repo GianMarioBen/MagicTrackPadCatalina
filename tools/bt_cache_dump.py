@@ -38,6 +38,15 @@ SEARCH_GLOBS = [
 DESC_PREFIXES = (b"\x05\x01", b"\x05\x0d", b"\x05\x0D", b"\x06\x00\xff",
                  b"\x06\x00\xFF")
 
+# Sequenze con cui inizia, quasi sempre, il descriptor di un dispositivo di
+# puntamento. Servono a ritrovarlo dentro un blob binario piu' grande.
+DESC_SIGNATURES = (
+    b"\x05\x01\x09\x02\xA1\x01",   # Generic Desktop / Mouse / Collection
+    b"\x05\x01\x09\x01\xA1\x01",   # Generic Desktop / Pointer
+    b"\x05\x0D\x09\x05\xA1\x01",   # Digitizer / Touch Pad
+    b"\x05\x01\x09\x06\xA1\x01",   # Generic Desktop / Keyboard
+)
+
 
 def norm_addr(a):
     return re.sub(r"[^0-9a-f]", "", a.lower())
@@ -74,6 +83,13 @@ def skeleton(node, depth, maxdepth, indent=4):
 
 
 def walk(node, path=()):
+    """Attraversa il plist scendendo anche dentro i blob annidati.
+
+    macOS serializza i record SDP di un dispositivo in un unico blob binario
+    (DeviceCache/<indirizzo>/Services). Se quel blob e' a sua volta un plist
+    binario lo si apre e lo si attraversa: e' li' dentro che finisce il report
+    descriptor HID.
+    """
     if isinstance(node, dict):
         for k, v in node.items():
             yield path + (str(k),), v
@@ -82,6 +98,13 @@ def walk(node, path=()):
         for i, v in enumerate(node):
             yield path + ("[%d]" % i,), v
             yield from walk(v, path + ("[%d]" % i,))
+    elif isinstance(node, (bytes, bytearray)) and node[:8] == b"bplist00":
+        try:
+            inner = plistlib.loads(bytes(node))
+        except Exception:
+            return
+        yield path + ("<bplist>",), inner
+        yield from walk(inner, path + ("<bplist>",))
 
 
 def main():
@@ -126,8 +149,17 @@ def main():
                 all_addr_hits.append((path, joined, typename(v)))
 
             if isinstance(v, (bytes, bytearray)) and len(v) >= 8:
-                if bytes(v[:3]) in DESC_PREFIXES or bytes(v[:2]) in DESC_PREFIXES:
-                    all_descs.append((path, joined, bytes(v)))
+                b = bytes(v)
+                if b[:3] in DESC_PREFIXES or b[:2] in DESC_PREFIXES:
+                    all_descs.append((path, joined, b, 0))
+                    continue
+                # descriptor annidato dentro un blob piu' grande
+                for sig in DESC_SIGNATURES:
+                    off = b.find(sig)
+                    if off >= 0:
+                        all_descs.append((path, joined + " @offset %d" % off,
+                                          b[off:], off))
+                        break
         print()
 
     print("=" * 72)
@@ -140,11 +172,14 @@ def main():
 
     print("Blob che hanno la forma di un report descriptor HID: %d"
           % len(all_descs))
-    for f, p, b in all_descs:
-        print("  %s\n    %s  (%d byte)" % (os.path.basename(f), p, len(b)))
-        print("    %s" % " ".join("%02X" % x for x in b[:48]))
-        if len(b) > 48:
+    for f, p, b, off in all_descs:
+        print("  %s\n    %s  (%d byte dal punto trovato)"
+              % (os.path.basename(f), p, len(b)))
+        for i in range(0, min(len(b), 96), 16):
+            print("    %s" % " ".join("%02X" % x for x in b[i:i + 16]))
+        if len(b) > 96:
             print("    ...")
+        print()
     if not all_descs:
         print("  nessuno.")
         print()
