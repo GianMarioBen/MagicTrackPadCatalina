@@ -42,8 +42,10 @@
 #define MAX_CONTACTS   16
 
 /* Range fisico del sensore, in unita' del dispositivo. */
-#define DEV_X_SPAN     7612.0   /* da -3678 a +3934 */
-#define DEV_Y_SPAN     5065.0   /* da -2478 a +2587 */
+#define DEV_X_MIN      (-3678)
+#define DEV_X_MAX      ( 3934)
+#define DEV_Y_MIN      (-2478)
+#define DEV_Y_MAX      ( 2587)
 
 /* Su SDK vecchi queste costanti possono mancare. */
 #ifndef kCGScrollWheelEventScrollPhase
@@ -73,9 +75,10 @@ static struct {
     int    no_events;       /* solo decodifica, nessun CGEvent */
     int    natural_scroll;
     int    tap_to_click;
+    int    edge_scroll;     /* scroll di bordo, per la modalita' a un contatto */
     double pointer_speed;
     double scroll_speed;
-} opt = { 0, 0, 1, 1, 1.0, 1.0 };
+} opt = { 0, 0, 1, 1, 1, 1.0, 1.0 };
 
 /* ------------------------------------------------------------------ */
 /* Decodifica                                                         */
@@ -247,24 +250,56 @@ static void post_key(CGKeyCode key, CGEventFlags flags) {
 /* Macchina a stati delle gesture                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Su Catalina il report descriptor puo' dichiarare una lunghezza sola,
+ * mentre quella dei report multitouch varia col numero di dita (4 + 9n).
+ * Dichiarando la misura di un contatto (13 byte) i report piu' lunghi
+ * arrivano troncati: si vede sempre e solo il primo dito.
+ *
+ * Il bridge si adatta da solo. Se arriva un contatto solo usa le zone di
+ * bordo per lo scroll e l'angolo per il click secondario; se ne arrivano
+ * due o piu' — perche' il descriptor e' stato dichiarato piu' lungo, o
+ * perche' un giorno il dispositivo verra' configurato per emettere report
+ * a lunghezza fissa — usa le gesture vere.
+ */
+
+/* Ampiezza delle zone di bordo, in unita' del dispositivo. */
+#define EDGE_RIGHT_X   (DEV_X_MAX - 620)
+#define EDGE_BOTTOM_Y  (DEV_Y_MIN + 520)
+/* Angolo per il click secondario: piu' piccolo della zona di scroll. */
+#define CORNER_X       (DEV_X_MAX - 1200)
+#define CORNER_Y       (DEV_Y_MIN + 900)
+
 typedef enum {
     G_IDLE = 0,
-    G_POINTER,
-    G_SCROLL,
-    G_SWIPE3,
+    G_POINTER,      /* un dito: muove il puntatore                     */
+    G_EDGE_V,       /* un dito sul bordo destro: scroll verticale      */
+    G_EDGE_H,       /* un dito sul bordo inferiore: scroll orizzontale */
+    G_SCROLL,       /* due dita: scroll vero                           */
+    G_SWIPE3,       /* tre dita                                        */
 } Gesture;
+
+static const char *gesture_name(Gesture g) {
+    switch (g) {
+    case G_POINTER: return "puntatore";
+    case G_EDGE_V:  return "scroll bordo destro";
+    case G_EDGE_H:  return "scroll bordo inferiore";
+    case G_SCROLL:  return "scroll due dita";
+    case G_SWIPE3:  return "swipe tre dita";
+    default:        return "-";
+    }
+}
 
 static struct {
     Gesture gesture;
     int     button_down;        /* pulsante fisico premuto */
-    int     right_click_armed;  /* click partito con due dita */
-    int     n_at_start;         /* dita al momento del tocco iniziale */
+    int     right_click_armed;  /* il click e' partito come secondario */
     int     max_contacts;       /* massimo visto in questa gesture */
     int     swipe_fired;
 
-    int     anchor_id;          /* dito che guida il puntatore */
+    int     anchor_id;          /* contatto che guida la gesture */
     double  last_x, last_y;
-    double  scroll_x, scroll_y; /* baricentro delle due dita */
+    double  scroll_x, scroll_y; /* baricentro, per lo scroll a due dita */
     double  travel;             /* distanza percorsa, per il tap */
     double  swipe_dx, swipe_dy;
 
@@ -272,7 +307,7 @@ static struct {
 } st;
 
 static void gesture_reset(void) {
-    if (st.gesture == G_SCROLL)
+    if (st.gesture == G_SCROLL || st.gesture == G_EDGE_V || st.gesture == G_EDGE_H)
         post_scroll(0, 0, PHASE_ENDED);
     memset(&st, 0, sizeof st);
 }
@@ -283,6 +318,18 @@ static Contact *find_contact(Contact *c, int n, int id) {
     return NULL;
 }
 
+static int in_corner(const Contact *c) {
+    return c->x > CORNER_X && c->y < CORNER_Y;
+}
+
+/* Quale gesture inizia un contatto solo, in base a dove si appoggia. */
+static Gesture zone_of(const Contact *c) {
+    if (!opt.edge_scroll)           return G_POINTER;
+    if (c->x > EDGE_RIGHT_X)        return G_EDGE_V;
+    if (c->y < EDGE_BOTTOM_Y)       return G_EDGE_H;
+    return G_POINTER;
+}
+
 static void handle_contacts(Contact *all, int n_all, int button) {
     Contact active[MAX_CONTACTS];
     int n = 0;
@@ -290,7 +337,7 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (all[i].down) active[n++] = all[i];
 
     if (opt.verbose) {
-        printf("dita=%d button=%d", n, button);
+        printf("dita=%d button=%d %-22s", n, button, gesture_name(st.gesture));
         for (int i = 0; i < n; i++)
             printf("  [id%d %+5d %+5d s%d p%d]",
                    active[i].id, active[i].x, active[i].y,
@@ -302,8 +349,9 @@ static void handle_contacts(Contact *all, int n_all, int button) {
     /* ---- pulsante fisico ---- */
     if (button && !st.button_down) {
         st.button_down = 1;
-        /* due dita appoggiate mentre si preme = click secondario */
-        st.right_click_armed = (n >= 2);
+        /* due dita appoggiate, oppure un dito nell'angolo in basso a
+         * destra: in entrambi i casi e' un click secondario. */
+        st.right_click_armed = (n >= 2) || (n == 1 && in_corner(&active[0]));
         post_button(st.right_click_armed ? kCGEventRightMouseDown
                                          : kCGEventLeftMouseDown,
                     st.right_click_armed ? kCGMouseButtonRight
@@ -322,8 +370,10 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (opt.tap_to_click && !st.button_down &&
             st.gesture != G_SWIPE3 && st.travel < 18.0 &&
             (CFAbsoluteTimeGetCurrent() - st.touch_start) < 0.25) {
-            if (st.max_contacts == 1)      post_click(kCGMouseButtonLeft);
-            else if (st.max_contacts == 2) post_click(kCGMouseButtonRight);
+            if (st.max_contacts == 1 && st.gesture == G_POINTER)
+                post_click(kCGMouseButtonLeft);
+            else if (st.max_contacts == 2)
+                post_click(kCGMouseButtonRight);
         }
         gesture_reset();
         return;
@@ -332,16 +382,17 @@ static void handle_contacts(Contact *all, int n_all, int button) {
     /* ---- inizio di una nuova gesture ---- */
     if (st.gesture == G_IDLE) {
         st.touch_start  = CFAbsoluteTimeGetCurrent();
-        st.n_at_start   = n;
         st.max_contacts = n;
         st.travel       = 0;
         cursor_sync();
 
         if (n == 1) {
-            st.gesture   = G_POINTER;
+            st.gesture   = zone_of(&active[0]);
             st.anchor_id = active[0].id;
             st.last_x    = active[0].x;
             st.last_y    = active[0].y;
+            if (st.gesture != G_POINTER)
+                post_scroll(0, 0, PHASE_BEGAN);
         } else if (n == 2) {
             st.gesture  = G_SCROLL;
             st.scroll_x = (active[0].x + active[1].x) / 2.0;
@@ -361,9 +412,11 @@ static void handle_contacts(Contact *all, int n_all, int button) {
 
     /* Cambio del numero di dita a meta' gesture: si ricomincia, cosi'
      * appoggiare un secondo dito passa da puntatore a scroll senza scatti. */
-    if ((st.gesture == G_POINTER && n != 1) ||
-        (st.gesture == G_SCROLL  && n != 2) ||
-        (st.gesture == G_SWIPE3  && n < 3)) {
+    int one_finger = (st.gesture == G_POINTER || st.gesture == G_EDGE_V ||
+                      st.gesture == G_EDGE_H);
+    if ((one_finger            && n != 1) ||
+        (st.gesture == G_SCROLL && n != 2) ||
+        (st.gesture == G_SWIPE3 && n < 3)) {
         int keep = st.max_contacts;
         int btn  = st.button_down;
         int rca  = st.right_click_armed;
@@ -389,6 +442,20 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         st.last_y = c->y;
         st.travel += fabs(dx) + fabs(dy);
         post_move(dx, dy, st.button_down);
+        break;
+    }
+    case G_EDGE_V:
+    case G_EDGE_H: {
+        Contact *c = find_contact(active, n, st.anchor_id);
+        if (!c) break;
+        double d = (st.gesture == G_EDGE_V)
+                 ? (c->y - st.last_y) * 0.115     /* bordo destro: usa y */
+                 : (c->x - st.last_x) * 0.115;    /* bordo inferiore: usa x */
+        st.last_x = c->x;
+        st.last_y = c->y;
+        st.travel += fabs(d);
+        if (st.gesture == G_EDGE_V) post_scroll(0, d, PHASE_CHANGED);
+        else                        post_scroll(-d, 0, PHASE_CHANGED);
         break;
     }
     case G_SCROLL: {
@@ -546,22 +613,31 @@ static void usage(const char *prog) {
     printf(
 "uso: %s [opzioni]\n"
 "\n"
-"  -v, --verbose         stampa i contatti decodificati\n"
-"      --no-events       decodifica soltanto, non genera eventi\n"
-"      --classic-scroll  direzione di scroll classica (non naturale)\n"
-"      --no-tap          disabilita il tap-to-click\n"
-"      --pointer N       velocita' del puntatore (default 1.0)\n"
-"      --scroll N        velocita' dello scroll  (default 1.0)\n"
-"  -h, --help            questo messaggio\n"
+"  -v, --verbose          stampa i contatti decodificati\n"
+"      --no-events        decodifica soltanto, non genera eventi\n"
+"      --classic-scroll   direzione di scroll classica (non naturale)\n"
+"      --no-tap           disabilita il tap-to-click\n"
+"      --no-edge-scroll   disabilita lo scroll lungo i bordi\n"
+"      --pointer N        velocita' del puntatore (default 1.0)\n"
+"      --scroll N         velocita' dello scroll  (default 1.0)\n"
+"  -h, --help             questo messaggio\n"
 "\n"
-"Gesture:\n"
-"  1 dito                puntatore\n"
-"  2 dita                scroll con inerzia\n"
-"  click                 click primario\n"
-"  click con 2 dita      click secondario\n"
-"  tap                   click primario     (--no-tap per disattivare)\n"
-"  tap con 2 dita        click secondario\n"
-"  swipe 3 dita          cambio spazio / Mission Control\n"
+"Con un contatto solo — cioe' quando il descriptor dichiara 13 byte e i\n"
+"report piu' lunghi arrivano troncati:\n"
+"\n"
+"  un dito                    puntatore\n"
+"  dito sul bordo destro      scroll verticale\n"
+"  dito sul bordo inferiore   scroll orizzontale\n"
+"  click                      click primario\n"
+"  click in basso a destra    click secondario\n"
+"  tap                        click primario     (--no-tap per disattivare)\n"
+"\n"
+"Se arrivano piu' contatti — descriptor dichiarato piu' lungo — il bridge\n"
+"se ne accorge da solo e passa alle gesture vere:\n"
+"\n"
+"  due dita                   scroll con inerzia\n"
+"  click o tap con due dita   click secondario\n"
+"  swipe a tre dita           cambio spazio / Mission Control\n"
 "\n", prog);
 }
 
@@ -572,6 +648,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-events"))      opt.no_events = 1;
         else if (!strcmp(a, "--classic-scroll")) opt.natural_scroll = 0;
         else if (!strcmp(a, "--no-tap"))         opt.tap_to_click = 0;
+        else if (!strcmp(a, "--no-edge-scroll"))  opt.edge_scroll = 0;
         else if (!strcmp(a, "--pointer") && i + 1 < argc) opt.pointer_speed = atof(argv[++i]);
         else if (!strcmp(a, "--scroll")  && i + 1 < argc) opt.scroll_speed  = atof(argv[++i]);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
