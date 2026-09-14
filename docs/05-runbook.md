@@ -5,6 +5,30 @@ report multitouch non e' dichiarato nel report descriptor, e su USB il
 descriptor viene letto dal dispositivo — non e' modificabile. Su Bluetooth
 viene dalla cache SDP di macOS, che invece si puo' riscrivere.
 
+## Dove sta il descriptor
+
+Non e' un valore leggibile nel plist. Sta dentro
+
+```
+DeviceCache/<indirizzo>/Services
+```
+
+che e' un blob binario contenente un plist serializzato (NSKeyedArchiver): il
+descriptor e' uno degli oggetti del suo array `$objects`. Una seconda copia
+sta sotto `CoreBluetoothCache/<UUID>/Services`, e vengono modificate entrambe.
+
+Sulla macchina di prova e' lungo 135 byte e dichiara:
+
+| Report | Cos'e' |
+|---|---|
+| `0x02` | mouse di compatibilita', 8 byte — da qui il `MaxInputReportSize = 8` |
+| `0x55` | feature da 64 byte, canale comandi vendor |
+| `0x90` | telemetria della batteria |
+
+Il report `0x31` non e' dichiarato. E' la conferma, letta dal disco, del
+motivo per cui IOHIDFamily scarta i report multitouch nel kernel: per macOS
+quel report non esiste.
+
 ## Il principio
 
 Non serve il descriptor originale di Apple. Serve solo che macOS **sappia

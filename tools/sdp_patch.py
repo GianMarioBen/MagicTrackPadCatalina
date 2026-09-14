@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """
-sdp_patch — sostituisce il report descriptor HID nella cache SDP Bluetooth.
+sdp_patch — dichiara a macOS il report multitouch 0x31 della Magic Trackpad.
 
-Il problema che risolve
------------------------
+Il problema
+-----------
 Per un dispositivo Bluetooth HID, il report descriptor che IOBluetoothHIDDriver
-pubblica non viene letto dal dispositivo: viene preso dall'attributo SDP 0x0206
-(HIDDescriptorList) messo in cache al pairing dentro
+pubblica non viene letto dal dispositivo: viene preso dai record SDP messi in
+cache in /Library/Preferences/com.apple.Bluetooth.plist, sotto
 
-    /Library/Preferences/com.apple.Bluetooth.plist
+    DeviceCache/<indirizzo>/Services
 
-Su Catalina la Magic Trackpad USB-C finisce in cache con il descriptor di
-compatibilita' mouse (MaxInputReportSize = 8), quindi il kernel scarta i report
-multitouch 0x31 prima che arrivino in user space. Sostituendo quel blob con il
-descriptor vero, i report arrivano per via ordinaria.
+che non e' un valore leggibile: e' un plist binario serializzato
+(NSKeyedArchiver) dentro un blob. Il report descriptor e' uno degli oggetti
+del suo array $objects.
+
+Per la Magic Trackpad quel descriptor dichiara il report 0x02 da 8 byte, cioe'
+il mouse di compatibilita', e il canale vendor. Il report multitouch 0x31 non
+e' dichiarato affatto: e' per questo che IOHIDFamily lo scarta nel kernel
+prima che raggiunga lo user space, anche quando il dispositivo lo trasmette.
+
+La soluzione non richiede il descriptor originale di Apple. Basta aggiungere
+in coda una collection che dichiari il report 0x31 lungo abbastanza.
 
 Uso
 ---
-    sudo ./sdp_patch.py --show                      # cosa c'e' ora in cache
+    sudo ./sdp_patch.py --show
     sudo ./sdp_patch.py --show --addr 04:B5:B2:7A:B9:8F
-    sudo ./sdp_patch.py --apply desc.txt --addr 04:B5:B2:7A:B9:8F
-    sudo ./sdp_patch.py --restore                   # torna al backup
-    sudo ./sdp_patch.py --watch  --apply desc.txt --addr 04:B5:B2:7A:B9:8F
+    sudo ./sdp_patch.py --add-multitouch --addr 04:B5:B2:7A:B9:8F
+    sudo ./sdp_patch.py --restore
 
-`desc.txt` e' l'output di `mt_desc_dump --hex` preso dal Mac moderno
-(esadecimale, spazi e a capo ignorati).
-
-Dopo --apply:
-    sudo killall -9 bluetoothd
-    (riconnetti il trackpad)
-    tools/triage.sh        -> MaxInputReportSize deve essere salito
-
---watch riapplica la patch se bluetoothd rifa' la query SDP e la sovrascrive.
+Dopo --add-multitouch:
+    sudo killall -9 cfprefsd bluetoothd
+    (spegni e riaccendi il trackpad)
+    ./tools/triage.sh        -> MaxInputReportSize deve valere 94, non 8
 """
 
 import argparse
@@ -39,32 +40,20 @@ import os
 import plistlib
 import re
 import shutil
-import subprocess
 import sys
-import time
 
 PLIST = "/Library/Preferences/com.apple.Bluetooth.plist"
 BACKUP_SUFFIX = ".mammetta-backup"
 
-# 0x0206 = HIDDescriptorList. Nel plist le chiavi degli attributi SDP sono
-# stringhe decimali.
-HID_DESCRIPTOR_ATTR = "518"
-
-# Un report descriptor HID plausibile comincia quasi sempre con
-# Usage Page (Generic Desktop) = 05 01, oppure Usage Page (Digitizer) = 05 0D.
-DESC_PREFIXES = (b"\x05\x01", b"\x05\x0d", b"\x05\x0D")
-
 # Numero massimo di contatti che vogliamo poter ricevere.
 MAX_CONTACTS = 10
 
-# Collection vendor che dichiara il report multitouch 0x31.
-#
 # Il conteggio e' scelto perche' la lunghezza TOTALE del report (report ID
 # compreso) valga 4 + 9*MAX_CONTACTS, cioe' la forma esatta del formato
 # multitouch. Cosi' sia che macOS consegni la lunghezza realmente ricevuta,
-# sia che riempia fino alla dimensione dichiarata, il decoder trova un
-# numero intero di contatti: gli eventuali contatti di riempimento hanno i
-# bit di stato a zero e vengono scartati come "dito sollevato".
+# sia che riempia fino alla dimensione dichiarata, il decoder trova un numero
+# intero di contatti, e quelli di riempimento hanno i bit di stato a zero e
+# vengono scartati come dito sollevato.
 _COUNT = 9 * MAX_CONTACTS + 3
 
 MULTITOUCH_COLLECTION = bytes([
@@ -80,6 +69,13 @@ MULTITOUCH_COLLECTION = bytes([
     0x81, 0x02,              #   Input (Data, Var, Abs)
     0xC0,                    # End Collection
 ])
+
+# Sequenze con cui inizia il descriptor di un dispositivo di puntamento.
+DESC_SIGNATURES = (
+    b"\x05\x01\x09\x02\xA1\x01",   # Generic Desktop / Mouse
+    b"\x05\x01\x09\x01\xA1\x01",   # Generic Desktop / Pointer
+    b"\x05\x0D\x09\x05\xA1\x01",   # Digitizer / Touch Pad
+)
 
 
 def die(msg, code=1):
@@ -111,189 +107,189 @@ def save_plist(data, path=PLIST):
     os.replace(tmp, path)
 
 
-def read_hex_file(path):
-    with open(path, "r") as f:
-        text = f.read()
-    # tiene solo le coppie esadecimali, ignora commenti e intestazioni
-    text = re.sub(r"(?m)^\s*[A-Za-z].*$", "", text)
-    hexes = re.findall(r"\b[0-9A-Fa-f]{2}\b", text)
-    if not hexes:
-        die("nessun byte esadecimale in %s" % path)
-    return bytes(int(h, 16) for h in hexes)
+class Descriptor:
+    """Un report descriptor trovato in cache, con il modo per riscriverlo.
 
-
-def walk(node, path=()):
-    """Genera (percorso, contenitore, chiave, valore) per ogni nodo."""
-    if isinstance(node, dict):
-        for k, v in list(node.items()):
-            yield path + (str(k),), node, k, v
-            yield from walk(v, path + (str(k),))
-    elif isinstance(node, list):
-        for i, v in enumerate(node):
-            yield path + ("[%d]" % i,), node, i, v
-            yield from walk(v, path + ("[%d]" % i,))
-
-
-def find_candidates(data, addr=None):
-    """Trova i blob che sembrano report descriptor HID.
-
-    Cerca sia sotto la chiave 518 (0x0206) sia, come rete di sicurezza,
-    qualsiasi data che inizi come un descriptor: nelle varie versioni di
-    macOS l'annidamento del record SDP cambia.
+    Il descriptor puo' stare direttamente come valore, oppure — ed e' il caso
+    reale — dentro l'archivio binario annidato del blob Services. Nel secondo
+    caso riscriverlo significa modificare l'oggetto dentro l'archivio e
+    riserializzare l'intero archivio nel blob.
     """
+
+    def __init__(self, path, container, key, data,
+                 archive=None, obj_index=None):
+        self.path = path
+        self.container = container
+        self.key = key
+        self.data = data
+        self.archive = archive
+        self.obj_index = obj_index
+
+    @property
+    def nested(self):
+        return self.archive is not None
+
+    def write(self, new_data):
+        if self.nested:
+            self.archive["$objects"][self.obj_index] = new_data
+            self.container[self.key] = plistlib.dumps(self.archive,
+                                                      fmt=plistlib.FMT_BINARY)
+        else:
+            self.container[self.key] = new_data
+        self.data = new_data
+
+
+def _looks_like_descriptor(b):
+    return any(b.startswith(sig) for sig in DESC_SIGNATURES)
+
+
+def find_descriptors(data, addr=None):
+    """Cerca i report descriptor, anche dentro gli archivi annidati."""
     want = norm_addr(addr) if addr else None
+    found = []
+
+    def device_matches(node, path):
+        if not want:
+            return True
+        # l'indirizzo puo' essere un segmento del percorso (DeviceCache)
+        if any(norm_addr(seg) == want for seg in path):
+            return True
+        # oppure un campo del dizionario del dispositivo (CoreBluetoothCache)
+        if isinstance(node, dict):
+            da = node.get("DeviceAddress")
+            if isinstance(da, str) and norm_addr(da) == want:
+                return True
+        return False
+
+    def visit(node, path, device_ok):
+        if isinstance(node, dict):
+            ok = device_ok or device_matches(node, path)
+            for k, v in node.items():
+                if isinstance(v, (bytes, bytearray)):
+                    inspect_blob(bytes(v), path + (str(k),), node, k, ok)
+                else:
+                    visit(v, path + (str(k),), ok)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                if not isinstance(v, (bytes, bytearray)):
+                    visit(v, path + ("[%d]" % i,), device_ok)
+
+    def inspect_blob(b, path, container, key, device_ok):
+        if not device_ok:
+            return
+        if _looks_like_descriptor(b):
+            found.append(Descriptor("/".join(path), container, key, b))
+            return
+        if b[:8] != b"bplist00":
+            return
+        try:
+            archive = plistlib.loads(b)
+        except Exception:
+            return
+        objs = archive.get("$objects") if isinstance(archive, dict) else None
+        if not isinstance(objs, list):
+            return
+        for i, o in enumerate(objs):
+            if isinstance(o, (bytes, bytearray)) and _looks_like_descriptor(bytes(o)):
+                found.append(Descriptor(
+                    "/".join(path) + "/<archivio>/$objects/[%d]" % i,
+                    container, key, bytes(o), archive, i))
+
+    visit(data, (), False)
+    return found
+
+
+def hexdump(b, limit=None):
     out = []
-
-    for path, container, key, value in walk(data):
-        if not isinstance(value, (bytes, bytearray)):
-            continue
-        if len(value) < 8:
-            continue
-
-        joined = "/".join(path)
-        under_attr = ("/%s/" % HID_DESCRIPTOR_ATTR) in ("/" + joined + "/")
-        looks_like = bytes(value[:2]) in DESC_PREFIXES
-
-        if not (under_attr or looks_like):
-            continue
-
-        if want:
-            # l'indirizzo compare come segmento del percorso, in una delle
-            # tante formattazioni possibili
-            if not any(norm_addr(seg) == want for seg in path):
-                continue
-
-        out.append({
-            "path": joined,
-            "container": container,
-            "key": key,
-            "data": bytes(value),
-            "under_attr": under_attr,
-        })
-    return out
+    end = len(b) if limit is None else min(len(b), limit)
+    for i in range(0, end, 16):
+        out.append("    " + " ".join("%02X" % x for x in b[i:i + 16]))
+    if limit is not None and len(b) > limit:
+        out.append("    ...")
+    return "\n".join(out)
 
 
-def hexdump(b, limit=64):
-    shown = b[:limit]
-    s = " ".join("%02X" % x for x in shown)
-    if len(b) > limit:
-        s += " ... (%d byte totali)" % len(b)
-    return s
+def report_ids(b):
+    """Estrae i report ID dichiarati, per dire subito cosa c'e' e cosa manca."""
+    ids, i = [], 0
+    while i < len(b):
+        pfx = b[i]
+        size = {0: 1, 1: 2, 2: 3, 3: 5}[pfx & 3]
+        if (pfx & 0xFC) == 0x84 and size == 2:      # Report ID
+            ids.append(b[i + 1])
+        i += size
+    return ids
 
 
 def cmd_show(args):
     data = load_plist()
-    cands = find_candidates(data, args.addr)
-    if not cands:
-        print("Nessun report descriptor trovato in cache"
+    descs = find_descriptors(data, args.addr)
+    if not descs:
+        print("Nessun report descriptor in cache"
               + (" per %s" % args.addr if args.addr else "") + ".")
-        print("Il trackpad e' accoppiato? Prova senza --addr per vedere tutto.")
         return
-    for i, c in enumerate(cands):
-        print("[%d] %s" % (i, c["path"]))
-        print("    attributo 0x0206: %s" % ("si" if c["under_attr"] else "no (euristica)"))
-        print("    lunghezza       : %d byte" % len(c["data"]))
-        print("    %s" % hexdump(c["data"]))
+    for i, d in enumerate(descs):
+        print("[%d] %s" % (i, d.path))
+        print("    %d byte, %s" % (len(d.data),
+              "dentro un archivio annidato" if d.nested else "valore diretto"))
+        ids = report_ids(d.data)
+        print("    report dichiarati: %s"
+              % (", ".join("0x%02X" % x for x in ids) or "nessuno"))
+        print("    multitouch 0x31  : %s"
+              % ("presente" if 0x31 in ids else "ASSENTE"))
+        print(hexdump(d.data, 96))
         print()
 
 
-def cmd_add_multitouch(args):
-    """Aggiunge in coda al descriptor esistente la collection del report 0x31.
-
-    Non sostituisce nulla di quello che c'e' gia': il mouse di compatibilita'
-    resta dichiarato com'era, e si aggiunge soltanto la dichiarazione del
-    report multitouch, che il descriptor originale non contiene. E' per
-    questo che IOHIDFamily scarta i report 0x31 prima che arrivino in user
-    space.
-    """
+def cmd_add_multitouch(args, quiet=False):
     data = load_plist()
-    cands = find_candidates(data, args.addr)
-    if not cands:
-        die("nessun descriptor in cache. Il trackpad e' accoppiato? "
-            "Prova prima --show.")
+    descs = find_descriptors(data, args.addr)
+    if not descs:
+        die("nessun descriptor in cache. Il trackpad e' connesso? "
+            "Prova prima --show senza --addr.")
 
-    targets = [c for c in cands if c["under_attr"]] or cands
-    if len(targets) > 1 and args.index is None:
-        print("Piu' candidati: scegli con --index N (vedi --show).")
-        for i, c in enumerate(targets):
-            print("  [%d] %s (%d byte)" % (i, c["path"], len(c["data"])))
-        sys.exit(2)
+    if args.index is not None:
+        descs = [descs[args.index]]
 
-    t = targets[args.index or 0]
-    old = t["data"]
+    changed = []
+    for d in descs:
+        if MULTITOUCH_COLLECTION in d.data:
+            if not quiet:
+                print("gia' a posto : %s" % d.path)
+            continue
+        if not quiet:
+            print("da modificare: %s" % d.path)
+            print("    %d -> %d byte" % (len(d.data),
+                                         len(d.data) + len(MULTITOUCH_COLLECTION)))
+        changed.append(d)
 
-    if MULTITOUCH_COLLECTION in old:
-        print("La collection multitouch e' gia' presente: niente da fare.")
+    if not changed:
+        if not quiet:
+            print("\nNiente da fare: la collection multitouch e' gia' presente.")
         return False
-
-    new = old + MULTITOUCH_COLLECTION
-
-    print("Descriptor in %s" % t["path"])
-    print("  prima : %d byte" % len(old))
-    print("  dopo  : %d byte (+%d)" % (len(new), len(MULTITOUCH_COLLECTION)))
-    print("  aggiunta: report 0x31, %d byte di dati, cioe' fino a %d contatti"
-          % (_COUNT, MAX_CONTACTS))
-    print("  %s" % " ".join("%02X" % b for b in MULTITOUCH_COLLECTION))
 
     backup = PLIST + BACKUP_SUFFIX
     if not os.path.exists(backup):
         shutil.copy2(PLIST, backup)
-        print("\nBackup: %s" % backup)
+        if not quiet:
+            print("\nBackup: %s" % backup)
 
-    t["container"][t["key"]] = new
+    for d in changed:
+        d.write(d.data + MULTITOUCH_COLLECTION)
+
     save_plist(data)
-    print("\nScritto.")
-    print("\nOra:")
-    print("  sudo killall -9 cfprefsd bluetoothd")
-    print("  (spegni e riaccendi il trackpad per farlo riconnettere)")
-    print("  ./tools/triage.sh      -> MaxInputReportSize deve valere %d"
-          % (_COUNT + 1))
-    print("  ./build/mammetta_bridge -v")
-    return True
 
-
-def cmd_apply(args):
-    new_desc = read_hex_file(args.apply)
-    print("Nuovo descriptor: %d byte" % len(new_desc))
-    print("  %s" % hexdump(new_desc, 32))
-
-    if bytes(new_desc[:2]) not in DESC_PREFIXES and not args.force:
-        die("non sembra un report descriptor (non inizia con 05 01 / 05 0D). "
-            "Usa --force se sei sicuro.")
-
-    data = load_plist()
-    cands = find_candidates(data, args.addr)
-    if not cands:
-        die("nessun blob da sostituire. Lancia prima --show.")
-
-    # preferisce quelli effettivamente sotto l'attributo 0x0206
-    targets = [c for c in cands if c["under_attr"]] or cands
-    if len(targets) > 1 and args.index is None:
-        print("\nPiu' candidati: scegli con --index N (vedi --show).")
-        for i, c in enumerate(targets):
-            print("  [%d] %s (%d byte)" % (i, c["path"], len(c["data"])))
-        sys.exit(2)
-
-    t = targets[args.index or 0]
-
-    backup = PLIST + BACKUP_SUFFIX
-    if not os.path.exists(backup):
-        shutil.copy2(PLIST, backup)
-        print("\nBackup: %s" % backup)
-    else:
-        print("\nBackup gia' presente: %s" % backup)
-
-    if t["data"] == new_desc:
-        print("Gia' applicato, niente da fare.")
-        return False
-
-    print("Sostituisco %s (%d -> %d byte)"
-          % (t["path"], len(t["data"]), len(new_desc)))
-    t["container"][t["key"]] = new_desc
-    save_plist(data)
-    print("Scritto.")
-    print("\nOra:  sudo killall -9 cfprefsd bluetoothd")
-    print("      (riconnetti il trackpad, poi tools/triage.sh)")
+    if not quiet:
+        print("\nAggiunta a %d descriptor la dichiarazione del report 0x31,"
+              % len(changed))
+        print("%d byte di dati, cioe' fino a %d contatti:" % (_COUNT, MAX_CONTACTS))
+        print(hexdump(MULTITOUCH_COLLECTION))
+        print("\nOra:")
+        print("  sudo killall -9 cfprefsd bluetoothd")
+        print("  spegni e riaccendi il trackpad e aspetta che si riconnetta")
+        print("  ./tools/triage.sh        -> MaxInputReportSize deve valere %d"
+              % (_COUNT + 1))
+        print("  ./build/mammetta_bridge -v")
     return True
 
 
@@ -307,19 +303,18 @@ def cmd_restore(args):
 
 
 def cmd_watch(args):
-    """Riapplica la patch se bluetoothd la sovrascrive."""
+    import subprocess
+    import time
     print("Sorveglianza di %s — Ctrl-C per uscire.\n" % PLIST)
-    last_mtime = 0
+    last = 0
     while True:
         try:
             mtime = os.path.getmtime(PLIST)
-            if mtime != last_mtime:
-                last_mtime = mtime
-                changed = (cmd_add_multitouch(args) if args.add_multitouch
-                           else cmd_apply(args))
-                if changed:
+            if mtime != last:
+                last = mtime
+                if cmd_add_multitouch(args, quiet=True):
                     print(">>> cache riscritta da bluetoothd, patch riapplicata "
-                          "(%s)\n" % time.strftime("%H:%M:%S"))
+                          "(%s)" % time.strftime("%H:%M:%S"))
                     subprocess.run(["killall", "-9", "cfprefsd"],
                                    stderr=subprocess.DEVNULL)
             time.sleep(2)
@@ -335,38 +330,30 @@ def cmd_watch(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Patch del report descriptor HID nella cache SDP Bluetooth.")
+        description="Dichiara a macOS il report multitouch 0x31.")
     p.add_argument("--show", action="store_true",
-                   help="mostra i descriptor in cache")
-    p.add_argument("--apply", metavar="FILE",
-                   help="sostituisce il descriptor con quello esadecimale in FILE")
+                   help="mostra i descriptor in cache e cosa dichiarano")
     p.add_argument("--add-multitouch", action="store_true",
-                   help="aggiunge al descriptor la dichiarazione del report 0x31")
-    p.add_argument("--restore", action="store_true",
-                   help="ripristina il backup")
+                   help="aggiunge la dichiarazione del report 0x31")
+    p.add_argument("--restore", action="store_true", help="ripristina il backup")
     p.add_argument("--watch", action="store_true",
                    help="riapplica la patch se viene sovrascritta")
     p.add_argument("--addr", metavar="BD_ADDR",
-                   help="limita al dispositivo con questo indirizzo Bluetooth")
-    p.add_argument("--index", type=int,
-                   help="quale candidato sostituire, se ce n'e' piu' di uno")
-    p.add_argument("--force", action="store_true",
-                   help="accetta un descriptor dall'aspetto insolito")
+                   help="limita al dispositivo con questo indirizzo")
+    p.add_argument("--index", type=int, help="agisci su un solo candidato")
     args = p.parse_args()
 
-    if (args.apply or args.restore or args.add_multitouch) and os.geteuid() != 0:
+    if (args.add_multitouch or args.restore) and os.geteuid() != 0:
         die("serve sudo per scrivere %s" % PLIST)
 
     if args.restore:
         cmd_restore(args)
+    elif args.watch:
+        if not args.add_multitouch:
+            die("--watch richiede --add-multitouch")
+        cmd_watch(args)
     elif args.add_multitouch:
         cmd_add_multitouch(args)
-    elif args.watch:
-        if not (args.apply or args.add_multitouch):
-            die("--watch richiede --apply FILE oppure --add-multitouch")
-        cmd_watch(args)
-    elif args.apply:
-        cmd_apply(args)
     elif args.show:
         cmd_show(args)
     else:
