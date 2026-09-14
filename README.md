@@ -1,42 +1,65 @@
 # Magic Trackpad USB-C su macOS Catalina
 
 Far funzionare una **Apple Magic Trackpad USB-C** (VID `0x004C`, PID `0x0324`)
-come vero trackpad su **macOS Catalina 10.15.8 (19H2036)**, che oggi la vede
-solo come mouse generico.
+su **macOS Catalina 10.15.8**, che la riconosce solo come mouse generico.
 
-Stato del lavoro pregresso: [`docs/01-handoff.md`](docs/01-handoff.md)
-Analisi e strategia attuale: [`docs/02-analisi.md`](docs/02-analisi.md)
-Formato dei report multitouch: [`docs/03-report-0x31.md`](docs/03-report-0x31.md)
+## Risolto
 
-## In due righe
+Catalina ha gia' il driver nativo per la Magic Trackpad — ma per il modello
+**Lightning**, PID `0x0265`. I due modelli sono funzionalmente identici:
+stesso Force Touch, stesso Taptic Engine, stesso multi-touch. Cambia il
+connettore, e cambia quel numero.
 
-Il trackpad, dopo il feature report `F1 02 01`, trasmette veri report
-multitouch HID (`0x31` su Bluetooth, `0x02` su USB). Il problema **non** è il
-dispositivo: è che Catalina ha pubblicato un `IOHIDDevice` con il *report
-descriptor di compatibilità mouse* (`MaxInputReportSize = 8`), quindi il
-kernel butta via i report da 14/23/32 byte prima che arrivino allo user space.
-
-La soluzione non è sniffare l'HCI. È **dare a Catalina il report descriptor
-giusto**, e poi leggere i report con una normalissima `IOHIDManager` e
-tradurli in `CGEvent`.
-
-## Layout
-
-```
-tools/triage.sh          diagnostica: come vede il trackpad questo Mac
-tools/mt_desc_dump.c     dump del report descriptor reale (da un Mac moderno)
-tools/mt_enable.c        invia il comando di abilitazione multitouch
-tools/sdp_patch.py       sostituisce il descriptor nella cache SDP Bluetooth
-tools/mt_decode.py       decoder offline dei .pklg / dump esadecimali
-src/mammetta_bridge.m    daemon: legge i report 0x31 e genera CGEvent
-Makefile                 build di tutto
-```
-
-## Build
+Quel numero sta nella cache Bluetooth di macOS. Riscrivendolo, Catalina
+riconosce il dispositivo e gli affida il driver nativo:
 
 ```bash
-make            # compila tutto in ./build
-make bridge     # solo il daemon
+sudo ./tools/sdp_patch.py --spoof-pid --addr <indirizzo del trackpad>
+sudo killall -9 cfprefsd bluetoothd
 ```
 
-Richiede Xcode Command Line Tools. Testato per il target 10.15.
+Poi si spegne e riaccende il trackpad. Trackpad nativo: multi-touch completo,
+Force Touch, gesture, pannello nelle Preferenze di Sistema. Nessun kext,
+nessun bridge, SIP attivo.
+
+Procedura completa e ripristino: [`docs/07-travestimento.md`](docs/07-travestimento.md).
+
+## Il resto del repo
+
+Tutto quello che c'e' oltre a questo e' il percorso fatto per arrivarci, e
+resta utile a chi debba capire come macOS tratta un dispositivo HID
+Bluetooth non riconosciuto.
+
+| | |
+|---|---|
+| [`01-handoff.md`](docs/01-handoff.md) | stato iniziale dell'indagine |
+| [`02-analisi.md`](docs/02-analisi.md) | perche' l'injector kext e la pista PacketLogger non potevano funzionare |
+| [`03-report-0x31.md`](docs/03-report-0x31.md) | protocollo multitouch completo, verificato sul dispositivo |
+| [`04-usb.md`](docs/04-usb.md) | i tre report descriptor su USB, decodificati |
+| [`05-runbook.md`](docs/05-runbook.md) | la regola con cui IOHIDFamily filtra i report per lunghezza |
+| [`06-indagine-vendor.md`](docs/06-indagine-vendor.md) | il canale comandi vendor, rimasto inesplorato |
+
+Il bridge in `src/` legge i report multitouch e li traduce in eventi di
+sistema. Serviva quando il driver nativo non si agganciava; ora non serve
+piu', ma resta funzionante e documentato.
+
+## Strumenti
+
+```
+tools/sdp_patch.py       travestimento del ProductID, patch del descriptor, ripristino
+tools/bt_cache_dump.py   dove macOS tiene i dati dei dispositivi Bluetooth
+tools/triage.sh          come questo Mac vede il trackpad
+tools/mt_enable.c        abilita il multitouch e osserva i report
+tools/mt_decode.py       decodifica report e catture PacketLogger
+tools/syntax-check/      analisi dei sorgenti macOS su qualunque macchina
+```
+
+## Ripristino
+
+```bash
+sudo ./tools/sdp_patch.py --restore
+sudo killall -9 cfprefsd bluetoothd
+```
+
+Riporta ProductID e report descriptor ai valori originali. **Annulla anche il
+travestimento**, quindi va usato solo per tornare davvero indietro.
