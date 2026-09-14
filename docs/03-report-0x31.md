@@ -105,8 +105,15 @@ x ∈ [-3678, +3934]      ≈ 7612 unità su ~160 mm  →  ~47,6 unità/mm
 y ∈ [-2478, +2587]      ≈ 5065 unità su ~115 mm  →  ~44   unità/mm
 ```
 
-y cresce verso l'alto (per questo il decoder lo nega): in coordinate schermo
-va invertito di nuovo.
+**Verso degli assi, verificato sul dispositivo**: dopo la decodifica x cresce
+verso destra e **y cresce verso il basso**, cioe' verso il bordo vicino a chi
+usa il trackpad — la stessa convenzione dello schermo, quindi in coordinate
+schermo **non va invertita**.
+
+E' il punto in cui e' piu' facile sbagliare. La negazione nella formula di y
+serve proprio a ottenere questo verso; chi copia la formula e poi tratta la y
+come se crescesse verso l'alto inverte tutto il verticale — puntatore e
+scroll — e si ritrova le zone di bordo sul lato opposto del pad.
 
 Questi valori sono coerenti con la tua cattura reale:
 

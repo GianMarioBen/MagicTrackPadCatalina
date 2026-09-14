@@ -272,12 +272,23 @@ static void post_key(CGKeyCode key, CGEventFlags flags) {
  * a lunghezza fissa — usa le gesture vere.
  */
 
+/*
+ * Orientamento degli assi, verificato sul dispositivo: dopo la decodifica
+ * x cresce verso destra e **y cresce verso il basso**, cioe' verso il bordo
+ * vicino a chi lo usa — la stessa convenzione dello schermo.
+ *
+ * E' il punto in cui e' facile sbagliare: il driver Linux nega la y proprio
+ * per ottenere questo, e chi copia la formula senza accorgersene finisce per
+ * invertire tutto il verticale, puntatore e scroll compresi, e per mettere
+ * le zone di bordo sul lato opposto del pad.
+ */
+
 /* Ampiezza delle zone di bordo, in unita' del dispositivo. */
 #define EDGE_RIGHT_X   (DEV_X_MAX - 620)
-#define EDGE_BOTTOM_Y  (DEV_Y_MIN + 520)
+#define EDGE_BOTTOM_Y  (DEV_Y_MAX - 520)
 /* Angolo per il click secondario: piu' piccolo della zona di scroll. */
 #define CORNER_X       (DEV_X_MAX - 1200)
-#define CORNER_Y       (DEV_Y_MIN + 900)
+#define CORNER_Y       (DEV_Y_MAX - 900)
 
 typedef enum {
     G_IDLE = 0,
@@ -328,14 +339,14 @@ static Contact *find_contact(Contact *c, int n, int id) {
 }
 
 static int in_corner(const Contact *c) {
-    return c->x > CORNER_X && c->y < CORNER_Y;
+    return c->x > CORNER_X && c->y > CORNER_Y;   /* y cresce verso il basso */
 }
 
 /* Quale gesture inizia un contatto solo, in base a dove si appoggia. */
 static Gesture zone_of(const Contact *c) {
     if (!opt.edge_scroll)           return G_POINTER;
     if (c->x > EDGE_RIGHT_X)        return G_EDGE_V;
-    if (c->y < EDGE_BOTTOM_Y)       return G_EDGE_H;
+    if (c->y > EDGE_BOTTOM_Y)       return G_EDGE_H;
     return G_POINTER;
 }
 
@@ -444,9 +455,10 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         Contact *c = find_contact(active, n, st.anchor_id);
         if (!c) { st.anchor_id = active[0].id;
                   st.last_x = active[0].x; st.last_y = active[0].y; break; }
-        /* unita' dispositivo -> punti schermo, y invertito */
+        /* unita' dispositivo -> punti schermo: stesso verso su entrambi
+         * gli assi, perche' la y decodificata cresce gia' verso il basso */
         double dx = (c->x - st.last_x) * 0.115;
-        double dy = -(c->y - st.last_y) * 0.115;
+        double dy = (c->y - st.last_y) * 0.115;
         st.last_x = c->x;
         st.last_y = c->y;
         st.travel += fabs(dx) + fabs(dy);
@@ -458,8 +470,8 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         Contact *c = find_contact(active, n, st.anchor_id);
         if (!c) break;
         double d = (st.gesture == G_EDGE_V)
-                 ? (c->y - st.last_y) * 0.115     /* bordo destro: usa y */
-                 : (c->x - st.last_x) * 0.115;    /* bordo inferiore: usa x */
+                 ? -(c->y - st.last_y) * 0.115    /* bordo destro: usa y */
+                 :  (c->x - st.last_x) * 0.115;   /* bordo inferiore: usa x */
         st.last_x = c->x;
         st.last_y = c->y;
         st.travel += fabs(d);
@@ -471,7 +483,7 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         double cx = (active[0].x + active[1].x) / 2.0;
         double cy = (active[0].y + active[1].y) / 2.0;
         double dx = -(cx - st.scroll_x) * 0.115;
-        double dy =  (cy - st.scroll_y) * 0.115;
+        double dy = -(cy - st.scroll_y) * 0.115;
         st.scroll_x = cx;
         st.scroll_y = cy;
         st.travel += fabs(dx) + fabs(dy);
@@ -489,7 +501,7 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (!st.swipe_fired) {
             if (st.swipe_dx >  900) { post_key(KEY_LEFT,  kCGEventFlagMaskControl); st.swipe_fired = 1; }
             else if (st.swipe_dx < -900) { post_key(KEY_RIGHT, kCGEventFlagMaskControl); st.swipe_fired = 1; }
-            else if (st.swipe_dy >  900) { post_key(KEY_UP,    kCGEventFlagMaskControl); st.swipe_fired = 1; }
+            else if (st.swipe_dy < -900) { post_key(KEY_UP,    kCGEventFlagMaskControl); st.swipe_fired = 1; }
         }
         break;
     }
