@@ -34,9 +34,10 @@
 #define BUF_SIZE       4096
 
 /* Bluetooth: feature report 0xF1. USB: report 0x02. */
+/* Sequenze prese da hid-magicmouse.c (magicmouse_enable_multitouch).
+ * Su USB il payload e' di DUE byte: il primo e' il report ID. */
 static const uint8_t ENABLE_BT[]  = { 0xF1, 0x02, 0x01 };
-static const uint8_t ENABLE_USB[] = { 0x02, 0x01, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00 };
+static const uint8_t ENABLE_USB[] = { 0x02, 0x01 };
 
 typedef struct {
     IOHIDDeviceRef dev;
@@ -124,15 +125,27 @@ static void on_report(void *ctx, IOReturn res, void *sender,
     Iface *f = (Iface *)ctx;
     f->reports++;
 
-    /* I report multitouch hanno lunghezza 4 + 9n (Bluetooth) o 6 + 9n (USB),
-     * conteggiando il byte di report ID. */
+    /* Lunghezza del report compreso il byte di report ID. */
     size_t n = (size_t)len + ((uint32_t)report[0] == reportID ? 0 : 1);
-    int mt = ((reportID == 0x31 && n >= 4  && (n - 4) % 9 == 0) ||
-              (reportID == 0x02 && n >= 6  && (n - 6) % 9 == 0));
+
+    /* Multitouch: 4 + 9n su Bluetooth (report 0x31), 12 + 9n su USB
+     * (report 0x02, lo stesso id del mouse di compatibilita': si
+     * distinguono solo dalla lunghezza). */
+    int fingers = -1;
+    if (reportID == 0x31 && n >= 4 && (n - 4) % 9 == 0)
+        fingers = (int)((n - 4) / 9);
+    else if (reportID == 0x02 && n >= 12 && (n - 12) % 9 == 0)
+        fingers = (int)((n - 12) / 9);
+
+    int mt = fingers >= 0;
     if (mt) f->multitouch_reports++;
 
+    char tag[24];
+    if (mt) snprintf(tag, sizeof tag, " MT %dd", fingers);
+    else    snprintf(tag, sizeof tag, "      ");
+
     printf("  [if %d] id=0x%02X len=%2ld%s : ",
-           (int)(f - g_if), reportID, (long)len, mt ? " MT" : "   ");
+           (int)(f - g_if), reportID, (long)len, tag);
     for (CFIndex i = 0; i < len && i < 34; i++) printf("%02X ", report[i]);
     if (len > 34) printf("...");
     printf("\n");

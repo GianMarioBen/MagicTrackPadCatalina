@@ -33,7 +33,11 @@ sbagliata.
 | Transport | Report ID | Payload feature |
 |---|---|---|
 | Bluetooth | `0xF1` | `F1 02 01` |
-| USB       | `0x02` | `02 01 00 00 00 00 00 00 00` |
+| USB       | `0x02` | `02 01` — **due byte soli** |
+
+Il primo byte del payload e' il report ID. Su USB il comando e' quindi lungo
+in tutto due byte: mandarne nove lo fa accettare da macOS ma non produce
+effetto.
 
 Va inviato come **feature report**. Dopo l'invio il dispositivo esce dalla
 modalità mouse di compatibilità: il puntatore smette di muoversi (è la
@@ -47,7 +51,14 @@ trackpad o riconnessione Bluetooth il dispositivo torna in modalità mouse.
 | Transport | Report ID | Header | Per contatto |
 |---|---|---|---|
 | Bluetooth | `0x31` | 4 byte | 9 byte |
-| USB       | `0x02` | 6 byte | 9 byte |
+| USB       | `0x02` | **12 byte** | 9 byte |
+
+Attenzione al report ID su USB: **e' `0x02`, lo stesso del mouse di
+compatibilita'**. I due si distinguono solo dalla lunghezza — 7 byte il mouse,
+`12 + 9n` il multitouch. Filtrare per report ID significa buttare via proprio
+i dati che si cercano.
+
+Lunghezze USB: 21 byte = 1 dito, 30 = 2 dita, 39 = 3 dita, 48 = 4 dita.
 
 Quindi su Bluetooth la lunghezza è sempre `4 + 9 × n_dita` (contando il byte
 di report ID), che è esattamente la relazione osservata nelle catture:
@@ -73,10 +84,16 @@ y           = -((t[3] << 30 | t[2] << 22 | t[1] << 14) >> 19)
 touch_major = t[4]
 touch_minor = t[5]
 size        = t[6]
-state       = t[7] & 0xF0     // != 0 → dito giù
+pressure    = t[7]
+state       = t[3] & 0xC0     // 0x80 = dito appoggiato
 id          = t[8] & 0x0F     // tracking id, stabile per tutta la gesture
 orientation = (t[8] >> 5) - 4
 ```
+
+Lo stato del contatto sta nei **due bit alti di `t[3]`**, non in `t[7]`: `t[3]`
+porta sia i due bit piu' alti di y sia i due bit di stato, e `t[7]` e' la
+pressione. Il Magic Trackpad di prima generazione usava invece `t[8]`, ed e' un
+errore facile da ereditare leggendo il codice sbagliato.
 
 Gli shift servono a fare l'estensione del segno: si porta il bit alto in cima
 a un intero a 32 bit e si fa uno shift aritmetico a destra.
@@ -105,3 +122,26 @@ L'id a 4 bit è **stabile per la durata del contatto** e viene riusato dopo il
 rilascio. È quello che permette di distinguere "due dita che scrollano" da
 "un dito sollevato e riappoggiato", ed è il motivo per cui il bridge può fare
 gesture serie e non solo delta grezzi.
+
+
+## Fonte
+
+Le costanti sono verificate contro `drivers/hid/hid-magicmouse.c` del kernel
+Linux, che dalla 6.x gestisce esplicitamente questo modello:
+
+```c
+#define USB_DEVICE_ID_APPLE_MAGICTRACKPAD2_USBC  0x0324
+#define TRACKPAD2_USB_REPORT_ID 0x02
+#define TRACKPAD2_BT_REPORT_ID  0x31
+
+const u8 feature_mt_trackpad2_usb[] = { 0x02, 0x01 };
+const u8 feature_mt_trackpad2_bt[]  = { 0xF1, 0x02, 0x01 };
+
+case TRACKPAD2_USB_REPORT_ID:
+    /* Expect twelve bytes of prefix and N*9 bytes of touch data. */
+    if (size < 12 || ((size - 12) % 9) != 0)
+        return 0;
+```
+
+Il decoder dei contatti segue `magicmouse_emit_touch`, ramo
+`USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 / _USBC`.

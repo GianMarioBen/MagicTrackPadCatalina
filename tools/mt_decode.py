@@ -21,7 +21,7 @@ import sys
 BT_REPORT_ID = 0x31
 BT_HEADER = 4
 USB_REPORT_ID = 0x02
-USB_HEADER = 6
+USB_HEADER = 12
 CONTACT_SIZE = 9
 
 X_MIN, X_MAX = -3678, 3934
@@ -43,8 +43,10 @@ def decode_contact(t):
         "touch_major": t[4],
         "touch_minor": t[5],
         "size": t[6],
-        "state": t[7] & 0xF0,
-        "down": (t[7] & 0xF0) != 0,
+        "pressure": t[7],
+        # lo stato sta nei due bit alti di t[3]: 0x80 = dito appoggiato
+        "state": t[3] & 0xC0,
+        "down": (t[3] & 0xC0) == 0x80,
         "id": t[8] & 0x0F,
         "orientation": (t[8] >> 5) - 4,
     }

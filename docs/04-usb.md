@@ -84,7 +84,31 @@ Quindi il canale giusto e': **output report `0x53` sull'interfaccia
 Il contenuto del comando, pero', non e' documentato. `mt_sweep` prova una
 matrice di candidati.
 
-## Se lo sweep non trova niente
+## Esito: il comando e' quello classico, mandato bene
+
+Lo sweep dei candidati non ha prodotto nulla, ma la risposta era nel driver
+Linux `hid-magicmouse.c`, che questo modello lo gestisce esplicitamente:
+
+```c
+const u8 feature_mt_trackpad2_usb[] = { 0x02, 0x01 };
+```
+
+Due byte, non nove, e **come feature report** — nonostante
+`MaxFeatureReportSize` valga 1 su tutte le interfacce, la richiesta passa
+sull'interfaccia mouse.
+
+E i dati tornano indietro con **report ID `0x02`, lo stesso del mouse di
+compatibilita'**, distinguibili solo dalla lunghezza (`12 + 9n` contro 7).
+
+Questo spiega perche' i tentativi precedenti sembravano fallire pur essendo
+andati a buon fine: sia `mt_enable` sia `mt_sweep` classificavano i report per
+ID, e scartavano `0x02` come "gia' noto". Il comando aveva funzionato e la
+risposta veniva buttata via.
+
+Morale: il canale vendor `0x53` / `0x3F` identificato dal descriptor esiste,
+ma non e' quello del multitouch. Serve ad altro.
+
+## Se serve catturare il traffico vero
 
 A quel punto conviene **catturare la sequenza vera invece di indovinarla**.
 Il modo piu' rapido e' una macchina Linux, anche un Raspberry Pi:

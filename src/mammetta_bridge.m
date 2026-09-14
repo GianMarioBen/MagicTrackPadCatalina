@@ -37,7 +37,7 @@
 #define BT_REPORT_ID   0x31
 #define BT_HEADER      4
 #define USB_REPORT_ID  0x02
-#define USB_HEADER     6
+#define USB_HEADER     12
 #define CONTACT_SIZE   9
 #define MAX_CONTACTS   16
 
@@ -62,8 +62,7 @@
 #define PHASE_ENDED   4
 
 static const uint8_t ENABLE_BT[]  = { 0xF1, 0x02, 0x01 };
-static const uint8_t ENABLE_USB[] = { 0x02, 0x01, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00 };
+static const uint8_t ENABLE_USB[] = { 0x02, 0x01 };
 
 /* ------------------------------------------------------------------ */
 /* Opzioni                                                            */
@@ -86,6 +85,7 @@ typedef struct {
     int id;
     int x, y;               /* unita' dispositivo, y verso l'alto */
     int touch_major, touch_minor, size;
+    int pressure;
     int down;
 } Contact;
 
@@ -102,7 +102,10 @@ static void decode_contact(const uint8_t *t, Contact *c) {
     c->touch_major = t[4];
     c->touch_minor = t[5];
     c->size        = t[6];
-    c->down        = (t[7] & 0xF0) != 0;
+    c->pressure    = t[7];
+    /* Lo stato del contatto sta nei due bit alti di t[3], non in t[7]:
+     * 0x80 = dito appoggiato. */
+    c->down        = (t[3] & 0xC0) == 0x80;
     c->id          = t[8] & 0x0F;
 }
 
@@ -289,8 +292,9 @@ static void handle_contacts(Contact *all, int n_all, int button) {
     if (opt.verbose) {
         printf("dita=%d button=%d", n, button);
         for (int i = 0; i < n; i++)
-            printf("  [id%d %+5d %+5d s%d]",
-                   active[i].id, active[i].x, active[i].y, active[i].size);
+            printf("  [id%d %+5d %+5d s%d p%d]",
+                   active[i].id, active[i].x, active[i].y,
+                   active[i].size, active[i].pressure);
         printf("\n");
         fflush(stdout);
     }
@@ -493,6 +497,10 @@ static void enable_multitouch(IOHIDDeviceRef dev) {
 
     IOReturn r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeFeature,
                                       cmd[0], cmd, (CFIndex)len);
+    /* Su alcune interfacce la feature non passa: si ritenta sull'output. */
+    if (r != kIOReturnSuccess)
+        r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput,
+                                 cmd[0], cmd, (CFIndex)len);
     printf("  abilitazione multitouch (%s): %s\n",
            bt ? "Bluetooth" : "USB",
            r == kIOReturnSuccess ? "OK" : "FALLITA");
