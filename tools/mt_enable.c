@@ -58,9 +58,31 @@ static int opt_desc = 0;
 static int opt_seize = 0;
 static int opt_repeat = 0;
 static int opt_terse = 0;
+static int opt_hist = 0;
 static double opt_secs = 12.0;
 
 static int g_mouse_reports = 0;
+
+/* Istogramma delle coppie (report id, lunghezza) ricevute. Serve a
+ * rispondere a una domanda sola: quali lunghezze macOS ci consegna davvero,
+ * dato che il descriptor puo' dichiararne una sola. */
+#define MAX_BUCKETS 64
+static struct { int id, len, count; } g_hist[MAX_BUCKETS];
+static int g_nbuckets = 0;
+
+static void hist_add(int id, int len) {
+    for (int i = 0; i < g_nbuckets; i++)
+        if (g_hist[i].id == id && g_hist[i].len == len) {
+            g_hist[i].count++;
+            return;
+        }
+    if (g_nbuckets < MAX_BUCKETS) {
+        g_hist[g_nbuckets].id = id;
+        g_hist[g_nbuckets].len = len;
+        g_hist[g_nbuckets].count = 1;
+        g_nbuckets++;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -149,6 +171,8 @@ static void on_report(void *ctx, IOReturn res, void *sender,
      * lo si conta e basta, per non sommergere il terminale. */
     int is_mouse = (reportID == 0x02 && len == 8);
     if (is_mouse) g_mouse_reports++;
+    hist_add((int)reportID, (int)len);
+    if (opt_hist) return;
     if (opt_terse && is_mouse) return;
 
     char tag[24];
@@ -210,6 +234,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seize")) opt_seize = 1;
         else if (!strcmp(argv[i], "--repeat")) opt_repeat = 1;
         else if (!strcmp(argv[i], "--terse")) opt_terse = 1;
+        else if (!strcmp(argv[i], "--hist")) opt_hist = 1;
         else { fprintf(stderr, "opzione sconosciuta: %s\n", argv[i]); return 2; }
     }
 
@@ -304,6 +329,24 @@ int main(int argc, char **argv) {
         }
     } else {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, opt_secs, false);
+    }
+
+    printf("\n=== Lunghezze ricevute ===\n");
+    if (g_nbuckets == 0) {
+        printf("  nessun report\n");
+    } else {
+        printf("  %-10s %-8s %-8s %s\n", "report", "byte", "quanti", "significato");
+        for (int i = 0; i < g_nbuckets; i++) {
+            int id = g_hist[i].id, len = g_hist[i].len;
+            char what[64] = "";
+            if (id == 0x02 && len == 8)
+                snprintf(what, sizeof what, "mouse di compatibilita'");
+            else if (id == 0x31 && len >= 4 && (len - 4) % 9 == 0)
+                snprintf(what, sizeof what, "multitouch, %d dit%s",
+                         (len - 4) / 9, (len - 4) / 9 == 1 ? "o" : "a");
+            printf("  0x%02X       %-8d %-8d %s\n", id, len,
+                   g_hist[i].count, what);
+        }
     }
 
     printf("\n=== Riepilogo ===\n");

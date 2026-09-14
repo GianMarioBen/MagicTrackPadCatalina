@@ -29,6 +29,21 @@ Il report `0x31` non e' dichiarato. E' la conferma, letta dal disco, del
 motivo per cui IOHIDFamily scarta i report multitouch nel kernel: per macOS
 quel report non esiste.
 
+## La regola che governa tutto
+
+Misurata sperimentalmente: **IOHIDFamily consegna un report solo se la sua
+lunghezza combacia esattamente con quella dichiarata nel descriptor.**
+
+| Dichiarato | Ricevuto | Esito |
+|---|---|---|
+| 94 byte (10 contatti) | 13 byte (1 dito) | scartati tutti, zero report |
+| 13 byte (1 contatto)  | 13 byte (1 dito) | 1193 report consegnati |
+
+Non riempie i report piu' corti del dichiarato. Questo e' il vincolo centrale
+del progetto, perche' la lunghezza dei report multitouch **varia col numero di
+dita**: 4 + 9n byte, cioe' 13 con un dito, 22 con due, 31 con tre. Il
+descriptor puo' dichiararne una sola.
+
 ## Il principio
 
 Non serve il descriptor originale di Apple. Serve solo che macOS **sappia
