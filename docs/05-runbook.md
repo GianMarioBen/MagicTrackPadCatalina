@@ -42,24 +42,39 @@ dichiarato com'era.
 
 Scollega il cavo, riaccendi il Bluetooth, fai riconnettere il trackpad.
 
+Nota: i blocchi qui sotto non contengono commenti. Nello zsh interattivo
+`#` non introduce un commento (l'opzione `interactive_comments` e' disattiva
+di default), quindi una riga di commento incollata viene eseguita come
+comando, e un apostrofo al suo interno lascia il terminale appeso al prompt
+`quote>`. Se succede, basta Ctrl-C.
+
+**1.** Guarda cosa c'e' ora in cache.
+
 ```bash
 cd ~/Desktop/MTCatalina
 git pull && make
-
-# 1. guarda cosa c'e' ora in cache
 sudo ./tools/sdp_patch.py --show --addr 04:B5:B2:7A:B9:8F
+```
 
-# 2. aggiungi la dichiarazione del report 0x31 (backup automatico)
+**2.** Aggiungi la dichiarazione del report `0x31`. Il backup e' automatico.
+
+```bash
 sudo ./tools/sdp_patch.py --add-multitouch --addr 04:B5:B2:7A:B9:8F
-
-# 3. fai rileggere la cache e riconnetti il trackpad
 sudo killall -9 cfprefsd bluetoothd
-#    spegni e riaccendi l'interruttore del trackpad
+```
 
-# 4. verifica: MaxInputReportSize deve valere 94, non 8
+**3.** Spegni e riaccendi l'interruttore del trackpad, e aspetta che si
+riconnetta.
+
+**4.** Verifica: `MaxInputReportSize` deve valere 94, non 8.
+
+```bash
 ./tools/triage.sh
+```
 
-# 5. avvia il bridge
+**5.** Avvia il bridge.
+
+```bash
 ./build/mammetta_bridge -v
 ```
 
