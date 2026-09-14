@@ -363,31 +363,52 @@ def cmd_watch(args):
 # ---------------------------------------------------------------------
 # Travestimento del ProductID
 # ---------------------------------------------------------------------
+#
+# Il ProductID non compare in un punto solo. Oltre alle chiavi di comodo
+# ProductID nei dizionari del dispositivo, lo stesso numero e' incapsulato
+# nei record SDP, che sono quelli che bluetoothd legge davvero. La'
+# dentro un valore e' un dizionario con DataElementType, DataElementSize e
+# DataElementValue, oppure, se il record e' rimasto in forma binaria, la
+# sequenza SDP dell'attributo 0x0202.
+#
+# Cambiare solo le chiavi di comodo non serve a niente: e' come cambiare
+# l'etichetta sulla cartella lasciando il documento dentro.
 
-class PidField:
-    """Un punto del plist dove compare il ProductID, con come riscriverlo."""
 
-    def __init__(self, path, container, key, value, archive=None, blob_key=None):
+# Attributo SDP 0x0202 (ProductID) seguito dal suo valore uint16.
+def _sdp_signature(pid):
+    return bytes([0x09, 0x02, 0x02, 0x09, (pid >> 8) & 0xFF, pid & 0xFF])
+
+
+class PidHit:
+    """Un punto dove compare il ProductID, con come riscriverlo."""
+
+    def __init__(self, path, kind, container, key, archive_ctx=None,
+                 blob_offset=None):
         self.path = path
+        self.kind = kind
         self.container = container
         self.key = key
-        self.value = value
-        self.archive = archive          # archivio annidato, se il campo e' dentro
-        self.blob_key = blob_key        # chiave del blob che lo contiene
+        self.archive_ctx = archive_ctx   # (blob_container, blob_key, archive)
+        self.blob_offset = blob_offset   # per i record SDP ancora binari
 
-    def write(self, new_value):
-        self.container[self.key] = new_value
-        if self.archive is not None:
-            # il campo sta dentro un archivio: va riserializzato nel blob
-            self.blob_container[self.blob_key] = plistlib.dumps(
-                self.archive, fmt=plistlib.FMT_BINARY)
-        self.value = new_value
+    def write(self, new_pid):
+        if self.blob_offset is not None:
+            b = bytearray(self.container[self.key])
+            o = self.blob_offset
+            b[o + 4] = (new_pid >> 8) & 0xFF
+            b[o + 5] = new_pid & 0xFF
+            self.container[self.key] = bytes(b)
+        else:
+            self.container[self.key] = new_pid
 
 
-def find_pid_fields(data, old_pid, addr=None):
-    """Cerca le chiavi ProductID del dispositivo, anche dentro gli archivi."""
+def find_pid_hits(data, old_pid, addr=None):
+    """Cerca il ProductID ovunque compaia nel sottoalbero del dispositivo."""
     want = norm_addr(addr) if addr else None
-    found = []
+    hits = []
+    archives = []          # (blob_container, blob_key, archive) da riserializzare
+    sig = _sdp_signature(old_pid)
 
     def device_matches(node, path):
         if not want:
@@ -400,82 +421,113 @@ def find_pid_fields(data, old_pid, addr=None):
                 return True
         return False
 
-    def visit(node, path, ok, archive, blob_container, blob_key):
+    def handle_bytes(b, container, key, path, ctx):
+        """Un blob puo' contenere un altro plist, oppure un record SDP
+        ancora in forma binaria. Vale per i blob dentro un dizionario come
+        per quelli dentro una lista."""
+        if b[:8] == b"bplist00":
+            try:
+                inner = plistlib.loads(b)
+            except Exception:
+                return
+            c = (container, key, inner)
+            archives.append(c)
+            visit(inner, path + ("<archivio>",), True, c)
+            return
+        off = b.find(sig)
+        while off >= 0:
+            hits.append(PidHit("/".join(path) + " @offset %d" % off,
+                               "record SDP binario", container, key, ctx, off))
+            off = b.find(sig, off + 1)
+
+    def is_pid(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v == old_pid
+
+    def visit(node, path, ok, ctx):
         if isinstance(node, dict):
             ok = ok or device_matches(node, path)
-            if ok and node.get("ProductID") == old_pid:
-                f = PidField("/".join(path) + "/ProductID", node, "ProductID",
-                             old_pid, archive, blob_key)
-                f.blob_container = blob_container
-                found.append(f)
-            for k, v in node.items():
-                if isinstance(v, (bytes, bytearray)) and bytes(v[:8]) == b"bplist00":
-                    try:
-                        inner = plistlib.loads(bytes(v))
-                    except Exception:
-                        continue
-                    visit(inner, path + (str(k), "<archivio>"), ok,
-                          inner, node, k)
-                elif not isinstance(v, (bytes, bytearray)):
-                    visit(v, path + (str(k),), ok, archive,
-                          blob_container, blob_key)
+            for k, v in list(node.items()):
+                kp = path + (str(k),)
+                if ok and is_pid(v):
+                    kind = ("chiave ProductID" if k == "ProductID"
+                            else "valore SDP" if k == "DataElementValue"
+                            else "intero")
+                    hits.append(PidHit("/".join(kp), kind, node, k, ctx))
+                elif isinstance(v, (bytes, bytearray)):
+                    if ok:
+                        handle_bytes(bytes(v), node, k, kp, ctx)
+                else:
+                    visit(v, kp, ok, ctx)
         elif isinstance(node, list):
-            for i, v in enumerate(node):
-                if not isinstance(v, (bytes, bytearray)):
-                    visit(v, path + ("[%d]" % i,), ok, archive,
-                          blob_container, blob_key)
+            for idx, v in enumerate(node):
+                ip = path + ("[%d]" % idx,)
+                if ok and is_pid(v):
+                    hits.append(PidHit("/".join(ip), "intero", node, idx, ctx))
+                elif isinstance(v, (bytes, bytearray)):
+                    if ok:
+                        handle_bytes(bytes(v), node, idx, ip, ctx)
+                else:
+                    visit(v, ip, ok, ctx)
 
-    visit(data, (), False, None, None, None)
-    return found
+    visit(data, (), False, None)
+    return hits, archives
+
+
+def _reserialize(archives):
+    """Riscrive nei blob gli archivi modificati, dal piu' interno al piu'
+    esterno, perche' un archivio puo' contenerne un altro."""
+    for blob_container, blob_key, archive in reversed(archives):
+        blob_container[blob_key] = plistlib.dumps(archive,
+                                                  fmt=plistlib.FMT_BINARY)
+
+
+def cmd_show_pid(args):
+    data = load_plist()
+    for pid, nome in ((PID_USBC, "USB-C"), (PID_LIGHTNING, "Lightning")):
+        hits, _ = find_pid_hits(data, pid, args.addr)
+        if not hits:
+            continue
+        print("ProductID %d (0x%04X) — %s : %d punti" % (pid, pid, nome, len(hits)))
+        for h in hits:
+            print("  %-22s %s" % (h.kind, h.path))
+        print()
 
 
 def cmd_spoof_pid(args):
     old, new = args.from_pid, args.to_pid
     data = load_plist()
-    fields = find_pid_fields(data, old, args.addr)
+    hits, archives = find_pid_hits(data, old, args.addr)
 
-    if not fields:
+    if not hits:
         print("Nessun ProductID = %d (0x%04X) trovato%s."
               % (old, old, " per %s" % args.addr if args.addr else ""))
-        print("Il dispositivo e' gia' travestito? Prova --show-pid.")
+        print("Gia' travestito? Guarda con --show-pid.")
         return False
 
     print("ProductID da cambiare: %d (0x%04X) -> %d (0x%04X)"
           % (old, old, new, new))
-    for f in fields:
-        print("  %s%s" % (f.path,
-              "   (dentro un archivio annidato)" if f.archive is not None else ""))
+    for h in hits:
+        print("  %-22s %s" % (h.kind, h.path))
 
     backup = PLIST + BACKUP_SUFFIX
     if not os.path.exists(backup):
         shutil.copy2(PLIST, backup)
         print("\nBackup: %s" % backup)
 
-    for f in fields:
-        f.write(new)
+    for h in hits:
+        h.write(new)
+    _reserialize(archives)
     save_plist(data)
 
-    print("\nScritto in %d punti." % len(fields))
+    print("\nScritto in %d punti." % len(hits))
     print("\nOra:")
     print("  sudo killall -9 cfprefsd bluetoothd")
     print("  spegni e riaccendi il trackpad e aspetta che si riconnetta")
+    print("  sudo %s --show-pid --addr %s" % (sys.argv[0], args.addr or ""))
     print("  ioreg -r -c AppleHSBluetoothDevice -l | head -40")
-    print("\nSe compare AppleHSBluetoothDevice, Catalina ha accettato il")
-    print("travestimento e il trackpad e' nativo: niente bridge, niente patch")
-    print("del descriptor, gesture e Force Touch come su un Mac recente.")
-    print("\nPer tornare indietro:  sudo %s --restore" % sys.argv[0])
+    print("\nIl controllo con --show-pid serve a vedere se bluetoothd ha")
+    print("rifatto la query SDP e riscritto il ProductID vero.")
     return True
-
-
-def cmd_show_pid(args):
-    data = load_plist()
-    for pid, nome in ((PID_USBC, "USB-C"), (PID_LIGHTNING, "Lightning")):
-        fields = find_pid_fields(data, pid, args.addr)
-        if fields:
-            print("ProductID %d (0x%04X) — %s : %d punti"
-                  % (pid, pid, nome, len(fields)))
-            for f in fields:
-                print("  %s" % f.path)
 
 
 def main():

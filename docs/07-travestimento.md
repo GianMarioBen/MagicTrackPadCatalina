@@ -42,6 +42,22 @@ che `AppleHSBluetoothDriver` si aspetta dal PID 613 — `F1 02 01` seguito da
 report `0x31` nel formato del Magic Trackpad 2. Il ProductID e' l'unica cosa
 che li distingue.
 
+## Dove si nasconde il ProductID
+
+Non in un punto solo. Il primo tentativo ne aveva cambiati due e non era
+bastato, perche' erano le chiavi di comodo: il numero che `bluetoothd` legge
+davvero sta nei **record SDP**, dentro il blob `Services`, e li' puo'
+presentarsi in tre forme diverse.
+
+| Forma | Come appare |
+|---|---|
+| chiave di comodo | `ProductID : 804` nel dizionario del dispositivo |
+| valore SDP interpretato | `{DataElementType: 1, DataElementSize: 2, DataElementValue: 804}` |
+| record SDP ancora binario | la sequenza `09 02 02 09 03 24`, cioe' attributo 0x0202 seguito dal valore uint16 |
+
+Lo strumento le cerca tutte e tre, dentro gli archivi annidati compresi, e
+lascia intatti il VendorID, il report descriptor e gli altri dispositivi.
+
 ## Procedura
 
 **1.** Guarda dove compare il ProductID.
