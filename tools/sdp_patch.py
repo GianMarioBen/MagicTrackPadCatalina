@@ -45,30 +45,51 @@ import sys
 PLIST = "/Library/Preferences/com.apple.Bluetooth.plist"
 BACKUP_SUFFIX = ".mammetta-backup"
 
-# Numero massimo di contatti che vogliamo poter ricevere.
-MAX_CONTACTS = 10
+# Quanti contatti deve dichiarare il report 0x31.
+#
+# In HID la lunghezza di un report e' fissa, ma quella dei report multitouch
+# reali varia col numero di dita: 4 + 9n byte, cioe' 13 per un dito, 22 per
+# due, 31 per tre. Qualunque valore si dichiari, quindi, combacia con un solo
+# numero di dita, e resta da stabilire per via sperimentale cosa faccia
+# IOHIDFamily con gli altri: se li scarta, se li tronca o se li riempie.
+# --contacts permette di misurarlo invece di scommetterci.
+DEFAULT_CONTACTS = 1
 
-# Il conteggio e' scelto perche' la lunghezza TOTALE del report (report ID
-# compreso) valga 4 + 9*MAX_CONTACTS, cioe' la forma esatta del formato
-# multitouch. Cosi' sia che macOS consegni la lunghezza realmente ricevuta,
-# sia che riempia fino alla dimensione dichiarata, il decoder trova un numero
-# intero di contatti, e quelli di riempimento hanno i bit di stato a zero e
-# vengono scartati come dito sollevato.
-_COUNT = 9 * MAX_CONTACTS + 3
 
-MULTITOUCH_COLLECTION = bytes([
-    0x06, 0x00, 0xFF,        # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x31,              # Usage (0x31)
-    0xA1, 0x01,              # Collection (Application)
-    0x85, 0x31,              #   Report ID (0x31)
-    0x09, 0x31,              #   Usage (0x31)
-    0x15, 0x00,              #   Logical Minimum (0)
-    0x26, 0xFF, 0x00,        #   Logical Maximum (255)
-    0x75, 0x08,              #   Report Size (8 bit)
-    0x95, _COUNT,            #   Report Count
-    0x81, 0x02,              #   Input (Data, Var, Abs)
-    0xC0,                    # End Collection
-])
+def multitouch_collection(contacts):
+    """Collection vendor che dichiara il report 0x31 per n contatti.
+
+    Il conteggio e' 9*n + 3 perche' la lunghezza TOTALE del report, compreso
+    il byte di report ID, valga 4 + 9*n.
+    """
+    count = 9 * contacts + 3
+    if not 1 <= count <= 255:
+        raise ValueError("numero di contatti fuori scala")
+    return bytes([
+        0x06, 0x00, 0xFF,        # Usage Page (Vendor Defined 0xFF00)
+        0x09, 0x31,              # Usage (0x31)
+        0xA1, 0x01,              # Collection (Application)
+        0x85, 0x31,              #   Report ID (0x31)
+        0x09, 0x31,              #   Usage (0x31)
+        0x15, 0x00,              #   Logical Minimum (0)
+        0x26, 0xFF, 0x00,        #   Logical Maximum (255)
+        0x75, 0x08,              #   Report Size (8 bit)
+        0x95, count,             #   Report Count
+        0x81, 0x02,              #   Input (Data, Var, Abs)
+        0xC0,                    # End Collection
+    ])
+
+
+# Tutte le varianti, per riconoscere e sostituire una patch precedente.
+ALL_COLLECTIONS = [multitouch_collection(n) for n in range(1, 28)]
+
+
+def strip_previous(desc):
+    """Toglie una collection multitouch gia' applicata, qualunque dimensione."""
+    for c in ALL_COLLECTIONS:
+        if desc.endswith(c):
+            return desc[:-len(c)]
+    return desc
 
 # Sequenze con cui inizia il descriptor di un dispositivo di puntamento.
 DESC_SIGNATURES = (
@@ -242,6 +263,10 @@ def cmd_show(args):
 
 
 def cmd_add_multitouch(args, quiet=False):
+    contacts = args.contacts
+    collection = multitouch_collection(contacts)
+    total = 4 + 9 * contacts
+
     data = load_plist()
     descs = find_descriptors(data, args.addr)
     if not descs:
@@ -253,14 +278,16 @@ def cmd_add_multitouch(args, quiet=False):
 
     changed = []
     for d in descs:
-        if MULTITOUCH_COLLECTION in d.data:
+        base = strip_previous(d.data)
+        if base + collection == d.data:
             if not quiet:
                 print("gia' a posto : %s" % d.path)
             continue
         if not quiet:
-            print("da modificare: %s" % d.path)
-            print("    %d -> %d byte" % (len(d.data),
-                                         len(d.data) + len(MULTITOUCH_COLLECTION)))
+            was = "" if base == d.data else " (sostituisce una patch precedente)"
+            print("da modificare: %s%s" % (d.path, was))
+            print("    %d -> %d byte" % (len(d.data), len(base) + len(collection)))
+        d.base = base
         changed.append(d)
 
     if not changed:
@@ -275,20 +302,20 @@ def cmd_add_multitouch(args, quiet=False):
             print("\nBackup: %s" % backup)
 
     for d in changed:
-        d.write(d.data + MULTITOUCH_COLLECTION)
+        d.write(d.base + collection)
 
     save_plist(data)
 
     if not quiet:
-        print("\nAggiunta a %d descriptor la dichiarazione del report 0x31,"
-              % len(changed))
-        print("%d byte di dati, cioe' fino a %d contatti:" % (_COUNT, MAX_CONTACTS))
-        print(hexdump(MULTITOUCH_COLLECTION))
+        print("\nDichiarato in %d descriptor il report 0x31 per %d contatt%s,"
+              % (len(changed), contacts, "o" if contacts == 1 else "i"))
+        print("cioe' %d byte in tutto:" % total)
+        print(hexdump(collection))
         print("\nOra:")
         print("  sudo killall -9 cfprefsd bluetoothd")
         print("  spegni e riaccendi il trackpad e aspetta che si riconnetta")
         print("  ./tools/triage.sh        -> MaxInputReportSize deve valere %d"
-              % (_COUNT + 1))
+              % total)
         print("  ./build/mammetta_bridge -v")
     return True
 
@@ -341,6 +368,11 @@ def main():
     p.add_argument("--addr", metavar="BD_ADDR",
                    help="limita al dispositivo con questo indirizzo")
     p.add_argument("--index", type=int, help="agisci su un solo candidato")
+    p.add_argument("--contacts", type=int, default=DEFAULT_CONTACTS,
+                   metavar="N",
+                   help="quanti contatti dichiarare nel report 0x31 "
+                        "(default %d, cioe' %d byte di report)"
+                        % (DEFAULT_CONTACTS, 4 + 9 * DEFAULT_CONTACTS))
     args = p.parse_args()
 
     if (args.add_multitouch or args.restore) and os.geteuid() != 0:
