@@ -55,7 +55,12 @@ static int   g_nif = 0;
 
 static int opt_listen_only = 0;
 static int opt_desc = 0;
+static int opt_seize = 0;
+static int opt_repeat = 0;
+static int opt_terse = 0;
 static double opt_secs = 12.0;
+
+static int g_mouse_reports = 0;
 
 /* ------------------------------------------------------------------ */
 
