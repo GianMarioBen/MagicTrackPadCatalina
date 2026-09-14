@@ -26,19 +26,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MT_VENDOR_ID   0x004C
+/* Il vendor ID cambia col transport: 0x05AC e' il vendor USB di Apple,
+ * 0x004C e' il company identifier Bluetooth. Stesso dispositivo, numeri
+ * diversi — quindi si fa il matching sul solo ProductID e si verifica
+ * il vendor dopo. */
+#define MT_VENDOR_USB  0x05AC
+#define MT_VENDOR_BT   0x004C
 #define MT_PRODUCT_ID  0x0324
 
 #define BT_REPORT_ID   0x31
 #define BT_HEADER      4
 #define USB_REPORT_ID  0x02
-#define USB_HEADER     6
+#define USB_HEADER     12
 #define CONTACT_SIZE   9
 #define MAX_CONTACTS   16
 
 /* Range fisico del sensore, in unita' del dispositivo. */
-#define DEV_X_SPAN     7612.0   /* da -3678 a +3934 */
-#define DEV_Y_SPAN     5065.0   /* da -2478 a +2587 */
+#define DEV_X_MIN      (-3678)
+#define DEV_X_MAX      ( 3934)
+#define DEV_Y_MIN      (-2478)
+#define DEV_Y_MAX      ( 2587)
 
 /* Su SDK vecchi queste costanti possono mancare. */
 #ifndef kCGScrollWheelEventScrollPhase
@@ -57,8 +64,7 @@
 #define PHASE_ENDED   4
 
 static const uint8_t ENABLE_BT[]  = { 0xF1, 0x02, 0x01 };
-static const uint8_t ENABLE_USB[] = { 0x02, 0x01, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00 };
+static const uint8_t ENABLE_USB[] = { 0x02, 0x01 };
 
 /* ------------------------------------------------------------------ */
 /* Opzioni                                                            */
@@ -69,9 +75,11 @@ static struct {
     int    no_events;       /* solo decodifica, nessun CGEvent */
     int    natural_scroll;
     int    tap_to_click;
+    int    edge_scroll;     /* scroll di bordo, per la modalita' a un contatto */
+    int    diag;            /* riga di stato una volta al secondo */
     double pointer_speed;
     double scroll_speed;
-} opt = { 0, 0, 1, 1, 1.0, 1.0 };
+} opt = { 0, 0, 1, 1, 1, 0, 1.0, 1.0 };
 
 /* ------------------------------------------------------------------ */
 /* Decodifica                                                         */
@@ -81,6 +89,7 @@ typedef struct {
     int id;
     int x, y;               /* unita' dispositivo, y verso l'alto */
     int touch_major, touch_minor, size;
+    int pressure;
     int down;
 } Contact;
 
@@ -97,7 +106,10 @@ static void decode_contact(const uint8_t *t, Contact *c) {
     c->touch_major = t[4];
     c->touch_minor = t[5];
     c->size        = t[6];
-    c->down        = (t[7] & 0xF0) != 0;
+    c->pressure    = t[7];
+    /* Lo stato del contatto sta nei due bit alti di t[3], non in t[7]:
+     * 0x80 = dito appoggiato. */
+    c->down        = (t[3] & 0xC0) == 0x80;
     c->id          = t[8] & 0x0F;
 }
 
@@ -130,6 +142,11 @@ static int decode_report(const uint8_t *data, size_t len,
 
 static CGPoint g_cursor;
 static int     g_cursor_valid = 0;
+
+/* Contatori per la diagnostica: servono a distinguere "non arrivano dati"
+ * da "arrivano dati ma gli eventi non vengono consegnati a nessuno". */
+static long g_events_posted = 0;
+static long g_reports_seen  = 0;
 
 static CGRect desktop_bounds(void) {
     CGDirectDisplayID ids[16];
@@ -182,6 +199,7 @@ static void post_move(double dx, double dy, int dragging) {
     CGEventSetDoubleValueField(e, kCGMouseEventDeltaY, my);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_scroll(double dx, double dy, int phase) {
@@ -202,6 +220,7 @@ static void post_scroll(double dx, double dy, int phase) {
     CGEventSetIntegerValueField(e, kCGScrollWheelEventScrollPhase, phase);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_button(CGEventType type, CGMouseButton button) {
@@ -211,6 +230,7 @@ static void post_button(CGEventType type, CGMouseButton button) {
     if (!e) return;
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
+    g_events_posted++;
 }
 
 static void post_click(CGMouseButton button) {
@@ -239,24 +259,67 @@ static void post_key(CGKeyCode key, CGEventFlags flags) {
 /* Macchina a stati delle gesture                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Su Catalina il report descriptor puo' dichiarare una lunghezza sola,
+ * mentre quella dei report multitouch varia col numero di dita (4 + 9n).
+ * Dichiarando la misura di un contatto (13 byte) i report piu' lunghi
+ * arrivano troncati: si vede sempre e solo il primo dito.
+ *
+ * Il bridge si adatta da solo. Se arriva un contatto solo usa le zone di
+ * bordo per lo scroll e l'angolo per il click secondario; se ne arrivano
+ * due o piu' — perche' il descriptor e' stato dichiarato piu' lungo, o
+ * perche' un giorno il dispositivo verra' configurato per emettere report
+ * a lunghezza fissa — usa le gesture vere.
+ */
+
+/*
+ * Orientamento degli assi, verificato sul dispositivo: dopo la decodifica
+ * x cresce verso destra e **y cresce verso il basso**, cioe' verso il bordo
+ * vicino a chi lo usa — la stessa convenzione dello schermo.
+ *
+ * E' il punto in cui e' facile sbagliare: il driver Linux nega la y proprio
+ * per ottenere questo, e chi copia la formula senza accorgersene finisce per
+ * invertire tutto il verticale, puntatore e scroll compresi, e per mettere
+ * le zone di bordo sul lato opposto del pad.
+ */
+
+/* Ampiezza delle zone di bordo, in unita' del dispositivo. */
+#define EDGE_RIGHT_X   (DEV_X_MAX - 620)
+#define EDGE_BOTTOM_Y  (DEV_Y_MAX - 520)
+/* Angolo per il click secondario: piu' piccolo della zona di scroll. */
+#define CORNER_X       (DEV_X_MAX - 1200)
+#define CORNER_Y       (DEV_Y_MAX - 900)
+
 typedef enum {
     G_IDLE = 0,
-    G_POINTER,
-    G_SCROLL,
-    G_SWIPE3,
+    G_POINTER,      /* un dito: muove il puntatore                     */
+    G_EDGE_V,       /* un dito sul bordo destro: scroll verticale      */
+    G_EDGE_H,       /* un dito sul bordo inferiore: scroll orizzontale */
+    G_SCROLL,       /* due dita: scroll vero                           */
+    G_SWIPE3,       /* tre dita                                        */
 } Gesture;
+
+static const char *gesture_name(Gesture g) {
+    switch (g) {
+    case G_POINTER: return "puntatore";
+    case G_EDGE_V:  return "scroll bordo destro";
+    case G_EDGE_H:  return "scroll bordo inferiore";
+    case G_SCROLL:  return "scroll due dita";
+    case G_SWIPE3:  return "swipe tre dita";
+    default:        return "-";
+    }
+}
 
 static struct {
     Gesture gesture;
     int     button_down;        /* pulsante fisico premuto */
-    int     right_click_armed;  /* click partito con due dita */
-    int     n_at_start;         /* dita al momento del tocco iniziale */
+    int     right_click_armed;  /* il click e' partito come secondario */
     int     max_contacts;       /* massimo visto in questa gesture */
     int     swipe_fired;
 
-    int     anchor_id;          /* dito che guida il puntatore */
+    int     anchor_id;          /* contatto che guida la gesture */
     double  last_x, last_y;
-    double  scroll_x, scroll_y; /* baricentro delle due dita */
+    double  scroll_x, scroll_y; /* baricentro, per lo scroll a due dita */
     double  travel;             /* distanza percorsa, per il tap */
     double  swipe_dx, swipe_dy;
 
@@ -264,7 +327,7 @@ static struct {
 } st;
 
 static void gesture_reset(void) {
-    if (st.gesture == G_SCROLL)
+    if (st.gesture == G_SCROLL || st.gesture == G_EDGE_V || st.gesture == G_EDGE_H)
         post_scroll(0, 0, PHASE_ENDED);
     memset(&st, 0, sizeof st);
 }
@@ -275,6 +338,18 @@ static Contact *find_contact(Contact *c, int n, int id) {
     return NULL;
 }
 
+static int in_corner(const Contact *c) {
+    return c->x > CORNER_X && c->y > CORNER_Y;   /* y cresce verso il basso */
+}
+
+/* Quale gesture inizia un contatto solo, in base a dove si appoggia. */
+static Gesture zone_of(const Contact *c) {
+    if (!opt.edge_scroll)           return G_POINTER;
+    if (c->x > EDGE_RIGHT_X)        return G_EDGE_V;
+    if (c->y > EDGE_BOTTOM_Y)       return G_EDGE_H;
+    return G_POINTER;
+}
+
 static void handle_contacts(Contact *all, int n_all, int button) {
     Contact active[MAX_CONTACTS];
     int n = 0;
@@ -282,10 +357,11 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (all[i].down) active[n++] = all[i];
 
     if (opt.verbose) {
-        printf("dita=%d button=%d", n, button);
+        printf("dita=%d button=%d %-22s", n, button, gesture_name(st.gesture));
         for (int i = 0; i < n; i++)
-            printf("  [id%d %+5d %+5d s%d]",
-                   active[i].id, active[i].x, active[i].y, active[i].size);
+            printf("  [id%d %+5d %+5d s%d p%d]",
+                   active[i].id, active[i].x, active[i].y,
+                   active[i].size, active[i].pressure);
         printf("\n");
         fflush(stdout);
     }
@@ -293,8 +369,9 @@ static void handle_contacts(Contact *all, int n_all, int button) {
     /* ---- pulsante fisico ---- */
     if (button && !st.button_down) {
         st.button_down = 1;
-        /* due dita appoggiate mentre si preme = click secondario */
-        st.right_click_armed = (n >= 2);
+        /* due dita appoggiate, oppure un dito nell'angolo in basso a
+         * destra: in entrambi i casi e' un click secondario. */
+        st.right_click_armed = (n >= 2) || (n == 1 && in_corner(&active[0]));
         post_button(st.right_click_armed ? kCGEventRightMouseDown
                                          : kCGEventLeftMouseDown,
                     st.right_click_armed ? kCGMouseButtonRight
@@ -313,8 +390,10 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (opt.tap_to_click && !st.button_down &&
             st.gesture != G_SWIPE3 && st.travel < 18.0 &&
             (CFAbsoluteTimeGetCurrent() - st.touch_start) < 0.25) {
-            if (st.max_contacts == 1)      post_click(kCGMouseButtonLeft);
-            else if (st.max_contacts == 2) post_click(kCGMouseButtonRight);
+            if (st.max_contacts == 1 && st.gesture == G_POINTER)
+                post_click(kCGMouseButtonLeft);
+            else if (st.max_contacts == 2)
+                post_click(kCGMouseButtonRight);
         }
         gesture_reset();
         return;
@@ -323,16 +402,17 @@ static void handle_contacts(Contact *all, int n_all, int button) {
     /* ---- inizio di una nuova gesture ---- */
     if (st.gesture == G_IDLE) {
         st.touch_start  = CFAbsoluteTimeGetCurrent();
-        st.n_at_start   = n;
         st.max_contacts = n;
         st.travel       = 0;
         cursor_sync();
 
         if (n == 1) {
-            st.gesture   = G_POINTER;
+            st.gesture   = zone_of(&active[0]);
             st.anchor_id = active[0].id;
             st.last_x    = active[0].x;
             st.last_y    = active[0].y;
+            if (st.gesture != G_POINTER)
+                post_scroll(0, 0, PHASE_BEGAN);
         } else if (n == 2) {
             st.gesture  = G_SCROLL;
             st.scroll_x = (active[0].x + active[1].x) / 2.0;
@@ -352,9 +432,11 @@ static void handle_contacts(Contact *all, int n_all, int button) {
 
     /* Cambio del numero di dita a meta' gesture: si ricomincia, cosi'
      * appoggiare un secondo dito passa da puntatore a scroll senza scatti. */
-    if ((st.gesture == G_POINTER && n != 1) ||
-        (st.gesture == G_SCROLL  && n != 2) ||
-        (st.gesture == G_SWIPE3  && n < 3)) {
+    int one_finger = (st.gesture == G_POINTER || st.gesture == G_EDGE_V ||
+                      st.gesture == G_EDGE_H);
+    if ((one_finger            && n != 1) ||
+        (st.gesture == G_SCROLL && n != 2) ||
+        (st.gesture == G_SWIPE3 && n < 3)) {
         int keep = st.max_contacts;
         int btn  = st.button_down;
         int rca  = st.right_click_armed;
@@ -373,20 +455,35 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         Contact *c = find_contact(active, n, st.anchor_id);
         if (!c) { st.anchor_id = active[0].id;
                   st.last_x = active[0].x; st.last_y = active[0].y; break; }
-        /* unita' dispositivo -> punti schermo, y invertito */
+        /* unita' dispositivo -> punti schermo: stesso verso su entrambi
+         * gli assi, perche' la y decodificata cresce gia' verso il basso */
         double dx = (c->x - st.last_x) * 0.115;
-        double dy = -(c->y - st.last_y) * 0.115;
+        double dy = (c->y - st.last_y) * 0.115;
         st.last_x = c->x;
         st.last_y = c->y;
         st.travel += fabs(dx) + fabs(dy);
         post_move(dx, dy, st.button_down);
         break;
     }
+    case G_EDGE_V:
+    case G_EDGE_H: {
+        Contact *c = find_contact(active, n, st.anchor_id);
+        if (!c) break;
+        double d = (st.gesture == G_EDGE_V)
+                 ? -(c->y - st.last_y) * 0.115    /* bordo destro: usa y */
+                 :  (c->x - st.last_x) * 0.115;   /* bordo inferiore: usa x */
+        st.last_x = c->x;
+        st.last_y = c->y;
+        st.travel += fabs(d);
+        if (st.gesture == G_EDGE_V) post_scroll(0, d, PHASE_CHANGED);
+        else                        post_scroll(-d, 0, PHASE_CHANGED);
+        break;
+    }
     case G_SCROLL: {
         double cx = (active[0].x + active[1].x) / 2.0;
         double cy = (active[0].y + active[1].y) / 2.0;
         double dx = -(cx - st.scroll_x) * 0.115;
-        double dy =  (cy - st.scroll_y) * 0.115;
+        double dy = -(cy - st.scroll_y) * 0.115;
         st.scroll_x = cx;
         st.scroll_y = cy;
         st.travel += fabs(dx) + fabs(dy);
@@ -404,7 +501,7 @@ static void handle_contacts(Contact *all, int n_all, int button) {
         if (!st.swipe_fired) {
             if (st.swipe_dx >  900) { post_key(KEY_LEFT,  kCGEventFlagMaskControl); st.swipe_fired = 1; }
             else if (st.swipe_dx < -900) { post_key(KEY_RIGHT, kCGEventFlagMaskControl); st.swipe_fired = 1; }
-            else if (st.swipe_dy >  900) { post_key(KEY_UP,    kCGEventFlagMaskControl); st.swipe_fired = 1; }
+            else if (st.swipe_dy < -900) { post_key(KEY_UP,    kCGEventFlagMaskControl); st.swipe_fired = 1; }
         }
         break;
     }
@@ -456,7 +553,25 @@ static void on_report(void *ctx, IOReturn res, void *sender,
         printf("Report multitouch in arrivo. Il bridge e' operativo.\n\n");
         fflush(stdout);
     }
+    g_reports_seen++;
     handle_contacts(contacts, count, button);
+
+    if (opt.diag) {
+        static CFAbsoluteTime last = 0;
+        static long r0 = 0, e0 = 0;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - last >= 1.0) {
+            int down = 0;
+            for (int i = 0; i < count; i++) if (contacts[i].down) down++;
+            printf("  report/s %-4ld  dita %d  %-22s  eventi/s %-4ld  "
+                   "accessibilita' %s\n",
+                   g_reports_seen - r0, down, gesture_name(st.gesture),
+                   g_events_posted - e0,
+                   AXIsProcessTrusted() ? "ok" : "MANCANTE");
+            fflush(stdout);
+            last = now; r0 = g_reports_seen; e0 = g_events_posted;
+        }
+    }
 }
 
 static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
@@ -465,6 +580,13 @@ static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
     if (v && CFGetTypeID(v) == CFNumberGetTypeID())
         CFNumberGetValue((CFNumberRef)v, kCFNumberLongType, &out);
     return out;
+}
+
+/* Accetta il dispositivo solo se il vendor e' quello USB o quello Bluetooth
+ * di Apple: il matching e' sul ProductID, che da solo non basta. */
+static int is_magic_trackpad(IOHIDDeviceRef dev) {
+    long vid = int_prop(dev, CFSTR(kIOHIDVendorIDKey));
+    return vid == MT_VENDOR_USB || vid == MT_VENDOR_BT;
 }
 
 static int is_bluetooth(IOHIDDeviceRef dev) {
@@ -481,6 +603,10 @@ static void enable_multitouch(IOHIDDeviceRef dev) {
 
     IOReturn r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeFeature,
                                       cmd[0], cmd, (CFIndex)len);
+    /* Su alcune interfacce la feature non passa: si ritenta sull'output. */
+    if (r != kIOReturnSuccess)
+        r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput,
+                                 cmd[0], cmd, (CFIndex)len);
     printf("  abilitazione multitouch (%s): %s\n",
            bt ? "Bluetooth" : "USB",
            r == kIOReturnSuccess ? "OK" : "FALLITA");
@@ -490,6 +616,7 @@ static void enable_multitouch(IOHIDDeviceRef dev) {
 
 static void on_match(void *ctx, IOReturn r, void *sender, IOHIDDeviceRef dev) {
     (void)ctx; (void)r; (void)sender;
+    if (!is_magic_trackpad(dev)) return;
 
     long maxIn = int_prop(dev, CFSTR(kIOHIDMaxInputReportSizeKey));
     printf("Trackpad collegato (%s)\n", is_bluetooth(dev) ? "Bluetooth" : "USB");
@@ -525,22 +652,33 @@ static void usage(const char *prog) {
     printf(
 "uso: %s [opzioni]\n"
 "\n"
-"  -v, --verbose         stampa i contatti decodificati\n"
-"      --no-events       decodifica soltanto, non genera eventi\n"
-"      --classic-scroll  direzione di scroll classica (non naturale)\n"
-"      --no-tap          disabilita il tap-to-click\n"
-"      --pointer N       velocita' del puntatore (default 1.0)\n"
-"      --scroll N        velocita' dello scroll  (default 1.0)\n"
-"  -h, --help            questo messaggio\n"
+"  -v, --verbose          stampa i contatti decodificati\n"
+"      --no-events        decodifica soltanto, non genera eventi\n"
+"      --classic-scroll   direzione di scroll classica (non naturale)\n"
+"      --no-tap           disabilita il tap-to-click\n"
+"      --no-edge-scroll   disabilita lo scroll lungo i bordi\n"
+"      --diag             riga di stato al secondo, per capire dove si\n"
+"                         perde il segnale\n"
+"      --pointer N        velocita' del puntatore (default 1.0)\n"
+"      --scroll N         velocita' dello scroll  (default 1.0)\n"
+"  -h, --help             questo messaggio\n"
 "\n"
-"Gesture:\n"
-"  1 dito                puntatore\n"
-"  2 dita                scroll con inerzia\n"
-"  click                 click primario\n"
-"  click con 2 dita      click secondario\n"
-"  tap                   click primario     (--no-tap per disattivare)\n"
-"  tap con 2 dita        click secondario\n"
-"  swipe 3 dita          cambio spazio / Mission Control\n"
+"Con un contatto solo — cioe' quando il descriptor dichiara 13 byte e i\n"
+"report piu' lunghi arrivano troncati:\n"
+"\n"
+"  un dito                    puntatore\n"
+"  dito sul bordo destro      scroll verticale\n"
+"  dito sul bordo inferiore   scroll orizzontale\n"
+"  click                      click primario\n"
+"  click in basso a destra    click secondario\n"
+"  tap                        click primario     (--no-tap per disattivare)\n"
+"\n"
+"Se arrivano piu' contatti — descriptor dichiarato piu' lungo — il bridge\n"
+"se ne accorge da solo e passa alle gesture vere:\n"
+"\n"
+"  due dita                   scroll con inerzia\n"
+"  click o tap con due dita   click secondario\n"
+"  swipe a tre dita           cambio spazio / Mission Control\n"
 "\n", prog);
 }
 
@@ -551,6 +689,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-events"))      opt.no_events = 1;
         else if (!strcmp(a, "--classic-scroll")) opt.natural_scroll = 0;
         else if (!strcmp(a, "--no-tap"))         opt.tap_to_click = 0;
+        else if (!strcmp(a, "--no-edge-scroll"))  opt.edge_scroll = 0;
+        else if (!strcmp(a, "--diag"))            opt.diag = 1;
         else if (!strcmp(a, "--pointer") && i + 1 < argc) opt.pointer_speed = atof(argv[++i]);
         else if (!strcmp(a, "--scroll")  && i + 1 < argc) opt.scroll_speed  = atof(argv[++i]);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -558,11 +698,29 @@ int main(int argc, char **argv) {
     }
 
     if (!opt.no_events && !AXIsProcessTrusted()) {
+        /* Chiedere il permesso apre direttamente il pannello di sistema:
+         * molto meglio che limitarsi ad avvisare, perche' senza questo
+         * permesso gli eventi vengono generati e buttati via in silenzio. */
+        const void *keys[] = { kAXTrustedCheckOptionPrompt };
+        const void *vals[] = { kCFBooleanTrue };
+        CFDictionaryRef o = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1,
+                                &kCFTypeDictionaryKeyCallBacks,
+                                &kCFTypeDictionaryValueCallBacks);
+        AXIsProcessTrustedWithOptions(o);
+        if (o) CFRelease(o);
+
         fprintf(stderr,
-            "Il processo non e' abilitato all'Accessibilita'.\n"
-            "Preferenze di Sistema -> Sicurezza e Privacy -> Privacy ->\n"
-            "Accessibilita': aggiungi il Terminale (o questo binario).\n"
-            "Senza, gli eventi vengono generati ma non consegnati.\n\n");
+            "\n**********************************************************\n"
+            "  MANCA IL PERMESSO DI ACCESSIBILITA'\n"
+            "\n"
+            "  Senza, il bridge legge il trackpad e decodifica tutto, ma\n"
+            "  gli eventi che genera non vengono consegnati a nessuno:\n"
+            "  il puntatore resta fermo e sembra che non funzioni niente.\n"
+            "\n"
+            "  Preferenze di Sistema -> Sicurezza e Privacy -> Privacy\n"
+            "  -> Accessibilita': aggiungi il Terminale e spunta la casella.\n"
+            "  Poi CHIUDI E RIAPRI il Terminale, e rilancia il bridge.\n"
+            "**********************************************************\n\n");
     }
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
@@ -571,13 +729,11 @@ int main(int argc, char **argv) {
     CFMutableDictionaryRef m = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    int vid = MT_VENDOR_ID, pid = MT_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+    int pid = MT_PRODUCT_ID;
     CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
-    CFDictionarySetValue(m, CFSTR(kIOHIDVendorIDKey), nv);
     CFDictionarySetValue(m, CFSTR(kIOHIDProductIDKey), np);
     IOHIDManagerSetDeviceMatching(mgr, m);
-    CFRelease(nv); CFRelease(np); CFRelease(m);
+    CFRelease(np); CFRelease(m);
 
     IOHIDManagerRegisterDeviceMatchingCallback(mgr, on_match, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(mgr, on_remove, NULL);
@@ -594,7 +750,7 @@ int main(int argc, char **argv) {
 
     cursor_sync();
     printf("mammetta_bridge — in attesa della Magic Trackpad USB-C "
-           "(VID 0x%04X PID 0x%04X)\n", MT_VENDOR_ID, MT_PRODUCT_ID);
+           "(PID 0x%04X)\n", MT_PRODUCT_ID);
     printf("Ctrl-C per uscire.\n\n");
     fflush(stdout);
 

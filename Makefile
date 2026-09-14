@@ -12,7 +12,7 @@ CFLAGS  := -Wall -Wextra -O2 -mmacosx-version-min=10.15
 FW_HID  := -framework IOKit -framework CoreFoundation
 FW_CG   := -framework ApplicationServices
 
-TOOLS   := $(BUILD)/mt_desc_dump $(BUILD)/mt_enable
+TOOLS   := $(BUILD)/mt_desc_dump $(BUILD)/mt_enable $(BUILD)/mt_sweep
 BRIDGE  := $(BUILD)/mammetta_bridge
 
 .PHONY: all bridge tools run triage clean

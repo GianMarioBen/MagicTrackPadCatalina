@@ -1,100 +1,313 @@
 /*
- * mt_enable — mette la Magic Trackpad USB-C in modalita' multitouch.
+ * mt_enable — sonda TUTTE le interfacce HID della Magic Trackpad USB-C,
+ * prova ad accendere il multitouch su ciascuna e ascolta cosa arriva.
  *
- * Versione diagnostica del comando che il bridge invia da solo.
- * Riconosce il transport e manda la sequenza giusta:
- *
- *   Bluetooth : feature report 0xF1  ->  F1 02 01
- *   USB       : feature report 0x02  ->  02 01 00 00 00 00 00 00 00
+ * Il dispositivo espone piu' interfacce con lo stesso VID/PID: una di
+ * compatibilita' mouse (UsagePage 0x01) e una o piu' vendor-defined Apple
+ * (UsagePage 0xFF00). Il comando di abilitazione va mandato a quella giusta,
+ * e a seconda del transport va mandato come feature report oppure come
+ * output report. Questo tool le prova tutte e dice cosa risponde ognuna.
  *
  *   clang -framework IOKit -framework CoreFoundation -o mt_enable mt_enable.c
- *   ./mt_enable            # abilita e poi ascolta i report per 10 secondi
- *   ./mt_enable --quiet    # abilita e basta
+ *
+ *   ./mt_enable              # sonda, abilita, ascolta 12 secondi
+ *   ./mt_enable --listen     # ascolta soltanto, non manda nulla
+ *   ./mt_enable --desc       # in piu' stampa i report descriptor
+ *   ./mt_enable --secs 30    # ascolta piu' a lungo
  *
  * Serve il permesso "Monitoraggio Input" per il Terminale.
- *
- * ATTESO: dopo l'abilitazione il puntatore smette di muoversi. E' corretto:
- * il dispositivo ha lasciato la modalita' mouse di compatibilita'.
- * Per tornare indietro basta spegnere e riaccendere il trackpad.
  */
 #include <IOKit/hid/IOHIDManager.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define MT_VENDOR_ID  0x004C
-#define MT_PRODUCT_ID 0x0324
+/* Il vendor ID cambia col transport: 0x05AC e' il vendor USB di Apple,
+ * 0x004C e' il company identifier Bluetooth. Stesso dispositivo, numeri
+ * diversi — quindi si fa il matching sul solo ProductID e si verifica
+ * il vendor dopo. */
+#define MT_VENDOR_USB  0x05AC
+#define MT_VENDOR_BT   0x004C
+#define MT_PRODUCT_ID  0x0324
+#define MAX_IFACES     32
+#define BUF_SIZE       4096
 
+/* Bluetooth: feature report 0xF1. USB: report 0x02. */
+/* Sequenze prese da hid-magicmouse.c (magicmouse_enable_multitouch).
+ * Su USB il payload e' di DUE byte: il primo e' il report ID. */
 static const uint8_t ENABLE_BT[]  = { 0xF1, 0x02, 0x01 };
-static const uint8_t ENABLE_USB[] = { 0x02, 0x01, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00 };
+static const uint8_t ENABLE_USB[] = { 0x02, 0x01 };
 
-static int g_quiet = 0;
-static int g_reports = 0;
-static uint8_t g_buf[1024];
+typedef struct {
+    IOHIDDeviceRef dev;
+    long   usage_page, usage;
+    long   max_in, max_out, max_feat;
+    int    bluetooth;
+    int    opened;
+    int    reports;
+    int    multitouch_reports;
+    uint8_t buf[BUF_SIZE];
+} Iface;
+
+static Iface g_if[MAX_IFACES];
+static int   g_nif = 0;
+
+static int opt_listen_only = 0;
+static int opt_desc = 0;
+static int opt_seize = 0;
+static int opt_repeat = 0;
+static int opt_terse = 0;
+static int opt_hist = 0;
+static int opt_ids = 0;
+static double opt_secs = 12.0;
+
+static int g_mouse_reports = 0;
+
+/* Istogramma delle coppie (report id, lunghezza) ricevute. Serve a
+ * rispondere a una domanda sola: quali lunghezze macOS ci consegna davvero,
+ * dato che il descriptor puo' dichiararne una sola. */
+#define MAX_BUCKETS 64
+static struct { int id, len, count; } g_hist[MAX_BUCKETS];
+static int g_nbuckets = 0;
+
+/* Tracking id visti attivi in ciascun secondo. Se il dispositivo manda un
+ * report per fotogramma, con due dita appoggiate ogni report ne contiene due
+ * e si vede un id solo per report; se invece manda un report per contatto,
+ * gli id si alternano. E' la differenza fra vedere un dito solo e vederli
+ * tutti. */
+static double g_t0 = 0;
+static int    g_sec = -1;
+static unsigned g_ids_mask = 0;
+static int    g_reports_sec = 0;
+
+static void ids_flush(void) {
+    if (g_sec < 0) return;
+    printf("  secondo %2d : %3d report, id attivi:", g_sec, g_reports_sec);
+    if (!g_ids_mask) printf(" nessuno");
+    else for (int i = 0; i < 16; i++)
+        if (g_ids_mask & (1u << i)) printf(" %d", i);
+    printf("\n");
+    fflush(stdout);
+}
+
+static void ids_add(const uint8_t *data, size_t n) {
+    size_t header;
+    if (data[0] == 0x31)      header = 4;
+    else if (data[0] == 0x02) header = 12;
+    else return;
+    if (n < header || (n - header) % 9) return;
+
+    double now = CFAbsoluteTimeGetCurrent();
+    if (g_t0 == 0) g_t0 = now;
+    int sec = (int)(now - g_t0);
+    if (sec != g_sec) {
+        ids_flush();
+        g_sec = sec;
+        g_ids_mask = 0;
+        g_reports_sec = 0;
+    }
+    g_reports_sec++;
+
+    for (size_t i = header; i + 9 <= n; i += 9) {
+        const uint8_t *t = data + i;
+        if ((t[3] & 0xC0) == 0x80)          /* dito appoggiato */
+            g_ids_mask |= 1u << (t[8] & 0x0F);
+    }
+}
+
+static void hist_add(int id, int len) {
+    for (int i = 0; i < g_nbuckets; i++)
+        if (g_hist[i].id == id && g_hist[i].len == len) {
+            g_hist[i].count++;
+            return;
+        }
+    if (g_nbuckets < MAX_BUCKETS) {
+        g_hist[g_nbuckets].id = id;
+        g_hist[g_nbuckets].len = len;
+        g_hist[g_nbuckets].count = 1;
+        g_nbuckets++;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
+static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
+    CFTypeRef v = IOHIDDeviceGetProperty(d, key);
+    long out = -1;
+    if (v && CFGetTypeID(v) == CFNumberGetTypeID())
+        CFNumberGetValue((CFNumberRef)v, kCFNumberLongType, &out);
+    return out;
+}
+
+/* Accetta il dispositivo solo se il vendor e' quello USB o quello Bluetooth
+ * di Apple: il matching e' sul ProductID, che da solo non basta. */
+static int is_magic_trackpad(IOHIDDeviceRef dev) {
+    long vid = int_prop(dev, CFSTR(kIOHIDVendorIDKey));
+    return vid == MT_VENDOR_USB || vid == MT_VENDOR_BT;
+}
 
 static int is_bluetooth(IOHIDDeviceRef dev) {
     CFTypeRef v = IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDTransportKey));
-    if (!v || CFGetTypeID(v) != CFStringGetTypeID()) return 1; /* default BT */
+    if (!v || CFGetTypeID(v) != CFStringGetTypeID()) return 1;
     return CFStringFind((CFStringRef)v, CFSTR("USB"),
                         kCFCompareCaseInsensitive).location == kCFNotFound;
 }
 
+static const char *ret_name(IOReturn r) {
+    switch (r) {
+    case kIOReturnSuccess:        return "OK";
+    case kIOReturnUnsupported:    return "non supportato";
+    case kIOReturnBadArgument:    return "argomento non valido (dimensione?)";
+    case kIOReturnNotOpen:        return "device non aperto";
+    case kIOReturnNotPermitted:   return "non permesso (Monitoraggio Input?)";
+    case kIOReturnNoDevice:       return "device sparito";
+    case kIOReturnExclusiveAccess:return "gia' in uso in modo esclusivo";
+    case kIOReturnTimeout:        return "timeout";
+    case kIOReturnAborted:        return "annullato";
+    default:                      return "?";
+    }
+}
+
+static void dump_descriptor(IOHIDDeviceRef dev) {
+    CFTypeRef rd = IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDReportDescriptorKey));
+    if (!rd || CFGetTypeID(rd) != CFDataGetTypeID()) {
+        printf("      report descriptor: non disponibile\n");
+        return;
+    }
+    CFDataRef data = (CFDataRef)rd;
+    const UInt8 *p = CFDataGetBytePtr(data);
+    CFIndex len = CFDataGetLength(data);
+    printf("      report descriptor: %ld byte\n      ", (long)len);
+    for (CFIndex i = 0; i < len; i++) {
+        printf("%02X", p[i]);
+        if ((i % 16) == 15 && i + 1 < len) printf("\n      ");
+        else if (i + 1 < len) printf(" ");
+    }
+    printf("\n");
+}
+
+/* ------------------------------------------------------------------ */
+
 static void on_report(void *ctx, IOReturn res, void *sender,
                       IOHIDReportType type, uint32_t reportID,
                       uint8_t *report, CFIndex len) {
-    (void)ctx; (void)res; (void)sender; (void)type;
-    g_reports++;
-    if (g_quiet) return;
-    printf("report id=0x%02X len=%ld : ", reportID, (long)len);
-    for (CFIndex i = 0; i < len && i < 40; i++) printf("%02X ", report[i]);
+    (void)sender; (void)type;
+    if (res != kIOReturnSuccess || len <= 0) return;
+
+    Iface *f = (Iface *)ctx;
+    f->reports++;
+
+    /* Lunghezza del report compreso il byte di report ID. */
+    size_t n = (size_t)len + ((uint32_t)report[0] == reportID ? 0 : 1);
+
+    /* Multitouch: 4 + 9n su Bluetooth (report 0x31), 12 + 9n su USB
+     * (report 0x02, lo stesso id del mouse di compatibilita': si
+     * distinguono solo dalla lunghezza). */
+    int fingers = -1;
+    if (reportID == 0x31 && n >= 4 && (n - 4) % 9 == 0)
+        fingers = (int)((n - 4) / 9);
+    else if (reportID == 0x02 && n >= 12 && (n - 12) % 9 == 0)
+        fingers = (int)((n - 12) / 9);
+
+    int mt = fingers >= 0;
+    if (mt) f->multitouch_reports++;
+
+    /* Il mouse di compatibilita' e' il report 0x02 da 8 byte: con --terse
+     * lo si conta e basta, per non sommergere il terminale. */
+    int is_mouse = (reportID == 0x02 && len == 8);
+    if (is_mouse) g_mouse_reports++;
+    hist_add((int)reportID, (int)len);
+
+    if (opt_ids) {
+        uint8_t stack[256];
+        const uint8_t *d = report;
+        size_t n = (size_t)len;
+        if ((uint32_t)report[0] != reportID && (size_t)len + 1 <= sizeof stack) {
+            stack[0] = (uint8_t)reportID;
+            memcpy(stack + 1, report, (size_t)len);
+            d = stack; n = (size_t)len + 1;
+        }
+        ids_add(d, n);
+        return;
+    }
+    if (opt_hist) return;
+    if (opt_terse && is_mouse) return;
+
+    char tag[24];
+    if (mt) snprintf(tag, sizeof tag, " MT %dd", fingers);
+    else    snprintf(tag, sizeof tag, "      ");
+
+    printf("  [if %d] id=0x%02X len=%2ld%s : ",
+           (int)(f - g_if), reportID, (long)len, tag);
+    for (CFIndex i = 0; i < len && i < 34; i++) printf("%02X ", report[i]);
+    if (len > 34) printf("...");
     printf("\n");
     fflush(stdout);
 }
 
 static void on_match(void *ctx, IOReturn r, void *sender, IOHIDDeviceRef dev) {
     (void)ctx; (void)r; (void)sender;
+    if (g_nif >= MAX_IFACES) return;
+    if (!is_magic_trackpad(dev)) return;
 
-    int bt = is_bluetooth(dev);
-    const uint8_t *cmd = bt ? ENABLE_BT : ENABLE_USB;
-    size_t cmd_len     = bt ? sizeof ENABLE_BT : sizeof ENABLE_USB;
+    Iface *f = &g_if[g_nif];
+    memset(f, 0, sizeof *f);
+    f->dev        = dev;
+    f->usage_page = int_prop(dev, CFSTR(kIOHIDPrimaryUsagePageKey));
+    f->usage      = int_prop(dev, CFSTR(kIOHIDPrimaryUsageKey));
+    f->max_in     = int_prop(dev, CFSTR(kIOHIDMaxInputReportSizeKey));
+    f->max_out    = int_prop(dev, CFSTR(kIOHIDMaxOutputReportSizeKey));
+    f->max_feat   = int_prop(dev, CFSTR(kIOHIDMaxFeatureReportSizeKey));
+    f->bluetooth  = is_bluetooth(dev);
+    g_nif++;
+}
 
-    printf("Trovato trackpad su %s\n", bt ? "Bluetooth" : "USB");
+/* ------------------------------------------------------------------ */
 
-    IOReturn ok = IOHIDDeviceOpen(dev, kIOHIDOptionsTypeNone);
-    printf("  IOHIDDeviceOpen      : 0x%08X\n", ok);
+static void try_enable(Iface *f, int idx) {
+    const uint8_t *cmd = f->bluetooth ? ENABLE_BT : ENABLE_USB;
+    size_t len         = f->bluetooth ? sizeof ENABLE_BT : sizeof ENABLE_USB;
 
-    ok = IOHIDDeviceSetReport(dev, kIOHIDReportTypeFeature,
-                              cmd[0], cmd, (CFIndex)cmd_len);
-    printf("  SetReport 0x%02X       : 0x%08X %s\n", cmd[0], ok,
-           ok == kIOReturnSuccess ? "OK" : "FALLITO");
+    printf("  [if %d] UsagePage 0x%04lX Usage 0x%02lX — invio %02X…(%zu byte)\n",
+           idx, f->usage_page, f->usage, cmd[0], len);
 
-    if (ok != kIOReturnSuccess) return;
+    IOReturn r = IOHIDDeviceSetReport(f->dev, kIOHIDReportTypeFeature,
+                                      cmd[0], cmd, (CFIndex)len);
+    printf("      feature : 0x%08X  %s\n", r, ret_name(r));
 
-    if (!g_quiet) {
-        IOHIDDeviceRegisterInputReportCallback(dev, g_buf, sizeof g_buf,
-                                               on_report, NULL);
-        printf("\nIn ascolto per 10 secondi — muovi le dita sul trackpad.\n\n");
+    /* Con MaxFeatureReportSize = 1 la feature non passa: su USB il comando
+     * va allora mandato sull'endpoint di output, che qui e' da 64 byte. */
+    if (r != kIOReturnSuccess && f->max_out > (long)len) {
+        IOReturn r2 = IOHIDDeviceSetReport(f->dev, kIOHIDReportTypeOutput,
+                                           cmd[0], cmd, (CFIndex)len);
+        printf("      output  : 0x%08X  %s\n", r2, ret_name(r2));
     }
 }
 
 int main(int argc, char **argv) {
-    for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--quiet")) g_quiet = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--listen")) opt_listen_only = 1;
+        else if (!strcmp(argv[i], "--desc")) opt_desc = 1;
+        else if (!strcmp(argv[i], "--secs") && i + 1 < argc) opt_secs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seize")) opt_seize = 1;
+        else if (!strcmp(argv[i], "--repeat")) opt_repeat = 1;
+        else if (!strcmp(argv[i], "--terse")) opt_terse = 1;
+        else if (!strcmp(argv[i], "--hist")) opt_hist = 1;
+        else if (!strcmp(argv[i], "--ids")) opt_ids = 1;
+        else { fprintf(stderr, "opzione sconosciuta: %s\n", argv[i]); return 2; }
+    }
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
                                              kIOHIDOptionsTypeNone);
-
     CFMutableDictionaryRef m = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    int vid = MT_VENDOR_ID, pid = MT_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+    int pid = MT_PRODUCT_ID;
     CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
-    CFDictionarySetValue(m, CFSTR(kIOHIDVendorIDKey), nv);
     CFDictionarySetValue(m, CFSTR(kIOHIDProductIDKey), np);
     IOHIDManagerSetDeviceMatching(mgr, m);
-    CFRelease(nv); CFRelease(np); CFRelease(m);
+    CFRelease(np); CFRelease(m);
 
     IOHIDManagerRegisterDeviceMatchingCallback(mgr, on_match, NULL);
     IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(),
@@ -102,19 +315,128 @@ int main(int argc, char **argv) {
 
     IOReturn ok = IOHIDManagerOpen(mgr, kIOHIDOptionsTypeNone);
     if (ok != kIOReturnSuccess) {
-        fprintf(stderr, "IOHIDManagerOpen: 0x%08X "
-                        "(manca il permesso Monitoraggio Input?)\n", ok);
+        fprintf(stderr, "IOHIDManagerOpen: 0x%08X — manca il permesso "
+                        "Monitoraggio Input per il Terminale?\n", ok);
         return 1;
     }
 
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, g_quiet ? 1.5 : 11.0, false);
+    /* Fase 1: raccolta delle interfacce. */
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
 
-    if (!g_quiet) {
-        printf("\nReport ricevuti: %d\n", g_reports);
-        if (g_reports == 0)
-            printf("Zero report = il kernel li sta scartando.\n"
-                   "Controlla MaxInputReportSize con tools/triage.sh:\n"
-                   "se vale 8, serve la patch del descriptor (docs/02-analisi.md).\n");
+    if (g_nif == 0) {
+        printf("Nessuna interfaccia trovata per PID 0x%04X "
+               "(vendor atteso 0x%04X su USB, 0x%04X su Bluetooth).\n",
+               MT_PRODUCT_ID, MT_VENDOR_USB, MT_VENDOR_BT);
+        return 1;
     }
+
+    printf("=== Interfacce trovate: %d ===\n\n", g_nif);
+    for (int i = 0; i < g_nif; i++) {
+        Iface *f = &g_if[i];
+        const char *kind =
+            (f->usage_page == 0x01 && f->usage == 0x02) ? "mouse di compatibilita'" :
+            (f->usage_page == 0xFF00)                   ? "vendor Apple" : "altro";
+        printf("  [%d] %s — UsagePage 0x%04lX Usage 0x%02lX (%s)\n",
+               i, f->bluetooth ? "Bluetooth" : "USB",
+               f->usage_page, f->usage, kind);
+        printf("      MaxInput %ld  MaxOutput %ld  MaxFeature %ld\n",
+               f->max_in, f->max_out, f->max_feat);
+        if (opt_desc) dump_descriptor(f->dev);
+    }
+    printf("\n");
+
+    /* Fase 2: apertura e ascolto. */
+    printf("=== Apertura ===\n");
+    for (int i = 0; i < g_nif; i++) {
+        Iface *f = &g_if[i];
+        IOReturn r = IOHIDDeviceOpen(f->dev, opt_seize
+                                     ? kIOHIDOptionsTypeSeizeDevice
+                                     : kIOHIDOptionsTypeNone);
+        f->opened = (r == kIOReturnSuccess);
+        printf("  [%d] open: 0x%08X %s\n", i, r, ret_name(r));
+        if (f->opened)
+            IOHIDDeviceRegisterInputReportCallback(f->dev, f->buf, BUF_SIZE,
+                                                   on_report, f);
+    }
+    printf("\n");
+
+    /* Fase 3: abilitazione. */
+    if (!opt_listen_only) {
+        printf("=== Abilitazione multitouch ===\n");
+        for (int i = 0; i < g_nif; i++)
+            if (g_if[i].opened) try_enable(&g_if[i], i);
+        printf("\n");
+    }
+
+    printf("=== Ascolto per %.0f secondi — muovi le dita sul trackpad ===\n",
+           opt_secs);
+    printf("    >>> guarda se il PUNTATORE SI FERMA: e' il segnale che il\n"
+           "        cambio di modo e' avvenuto <<<\n\n");
+    fflush(stdout);
+
+    if (opt_repeat) {
+        double spent = 0;
+        while (spent < opt_secs) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false);
+            spent += 2.0;
+            for (int i = 0; i < g_nif; i++)
+                if (g_if[i].opened) {
+                    const uint8_t *cmd = g_if[i].bluetooth ? ENABLE_BT : ENABLE_USB;
+                    size_t l = g_if[i].bluetooth ? sizeof ENABLE_BT : sizeof ENABLE_USB;
+                    IOHIDDeviceSetReport(g_if[i].dev, kIOHIDReportTypeFeature,
+                                         cmd[0], cmd, (CFIndex)l);
+                }
+        }
+    } else {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, opt_secs, false);
+    }
+
+    if (opt_ids) { ids_flush(); printf("\n"); }
+
+    printf("\n=== Lunghezze ricevute ===\n");
+    if (g_nbuckets == 0) {
+        printf("  nessun report\n");
+    } else {
+        printf("  %-10s %-8s %-8s %s\n", "report", "byte", "quanti", "significato");
+        for (int i = 0; i < g_nbuckets; i++) {
+            int id = g_hist[i].id, len = g_hist[i].len;
+            char what[64] = "";
+            if (id == 0x02 && len == 8)
+                snprintf(what, sizeof what, "mouse di compatibilita'");
+            else if (id == 0x31 && len >= 4 && (len - 4) % 9 == 0)
+                snprintf(what, sizeof what, "multitouch, %d dit%s",
+                         (len - 4) / 9, (len - 4) / 9 == 1 ? "o" : "a");
+            printf("  0x%02X       %-8d %-8d %s\n", id, len,
+                   g_hist[i].count, what);
+        }
+    }
+
+    printf("\n=== Riepilogo ===\n");
+    int total = 0, total_mt = 0;
+    for (int i = 0; i < g_nif; i++) {
+        printf("  [%d] UsagePage 0x%04lX Usage 0x%02lX : %d report, "
+               "di cui %d multitouch\n",
+               i, g_if[i].usage_page, g_if[i].usage,
+               g_if[i].reports, g_if[i].multitouch_reports);
+        total    += g_if[i].reports;
+        total_mt += g_if[i].multitouch_reports;
+    }
+    printf("\n  totale: %d report, %d multitouch\n", total, total_mt);
+    printf("  di cui mouse di compatibilita' (0x02 da 8 byte): %d\n",
+           g_mouse_reports);
+    if (g_mouse_reports > 0 && total_mt == 0)
+        printf("\n  Il mouse di compatibilita' continua a trasmettere: il\n"
+               "  dispositivo NON e' passato in modalita' multitouch.\n");
+
+    if (total == 0)
+        printf("\n  Zero report ovunque: o il kernel li scarta, o un altro\n"
+               "  driver tiene le interfacce in accesso esclusivo.\n");
+    else if (total_mt == 0)
+        printf("\n  Arrivano report ma nessuno ha la forma multitouch:\n"
+               "  l'abilitazione non ha preso, oppure il formato e' diverso\n"
+               "  da quello atteso. Manda a Camilla le righe qui sopra.\n");
+    else
+        printf("\n  Multitouch confermato su USB.\n");
+
     return 0;
 }
