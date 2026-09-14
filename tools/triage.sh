@@ -17,7 +17,7 @@ echo "=== Istanze IOHIDDevice con ProductID 804 (0x0324) ==="
 import plistlib, subprocess, sys
 
 pid_wanted = int(sys.argv[1])
-xml = subprocess.run(["ioreg", "-a", "-l", "-r", "-c", "IOHIDDevice"],
+xml = subprocess.run(["ioreg", "-a", "-l", "-r", "-d", "1", "-c", "IOHIDDevice"],
                      capture_output=True).stdout
 if not xml.strip():
     print("  nessun IOHIDDevice trovato")
