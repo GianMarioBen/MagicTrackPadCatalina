@@ -59,6 +59,7 @@ static int opt_seize = 0;
 static int opt_repeat = 0;
 static int opt_terse = 0;
 static int opt_hist = 0;
+static int opt_ids = 0;
 static double opt_secs = 12.0;
 
 static int g_mouse_reports = 0;
@@ -69,6 +70,51 @@ static int g_mouse_reports = 0;
 #define MAX_BUCKETS 64
 static struct { int id, len, count; } g_hist[MAX_BUCKETS];
 static int g_nbuckets = 0;
+
+/* Tracking id visti attivi in ciascun secondo. Se il dispositivo manda un
+ * report per fotogramma, con due dita appoggiate ogni report ne contiene due
+ * e si vede un id solo per report; se invece manda un report per contatto,
+ * gli id si alternano. E' la differenza fra vedere un dito solo e vederli
+ * tutti. */
+static double g_t0 = 0;
+static int    g_sec = -1;
+static unsigned g_ids_mask = 0;
+static int    g_reports_sec = 0;
+
+static void ids_flush(void) {
+    if (g_sec < 0) return;
+    printf("  secondo %2d : %3d report, id attivi:", g_sec, g_reports_sec);
+    if (!g_ids_mask) printf(" nessuno");
+    else for (int i = 0; i < 16; i++)
+        if (g_ids_mask & (1u << i)) printf(" %d", i);
+    printf("\n");
+    fflush(stdout);
+}
+
+static void ids_add(const uint8_t *data, size_t n) {
+    size_t header;
+    if (data[0] == 0x31)      header = 4;
+    else if (data[0] == 0x02) header = 12;
+    else return;
+    if (n < header || (n - header) % 9) return;
+
+    double now = CFAbsoluteTimeGetCurrent();
+    if (g_t0 == 0) g_t0 = now;
+    int sec = (int)(now - g_t0);
+    if (sec != g_sec) {
+        ids_flush();
+        g_sec = sec;
+        g_ids_mask = 0;
+        g_reports_sec = 0;
+    }
+    g_reports_sec++;
+
+    for (size_t i = header; i + 9 <= n; i += 9) {
+        const uint8_t *t = data + i;
+        if ((t[3] & 0xC0) == 0x80)          /* dito appoggiato */
+            g_ids_mask |= 1u << (t[8] & 0x0F);
+    }
+}
 
 static void hist_add(int id, int len) {
     for (int i = 0; i < g_nbuckets; i++)
@@ -172,6 +218,19 @@ static void on_report(void *ctx, IOReturn res, void *sender,
     int is_mouse = (reportID == 0x02 && len == 8);
     if (is_mouse) g_mouse_reports++;
     hist_add((int)reportID, (int)len);
+
+    if (opt_ids) {
+        uint8_t stack[256];
+        const uint8_t *d = report;
+        size_t n = (size_t)len;
+        if ((uint32_t)report[0] != reportID && (size_t)len + 1 <= sizeof stack) {
+            stack[0] = (uint8_t)reportID;
+            memcpy(stack + 1, report, (size_t)len);
+            d = stack; n = (size_t)len + 1;
+        }
+        ids_add(d, n);
+        return;
+    }
     if (opt_hist) return;
     if (opt_terse && is_mouse) return;
 
@@ -235,6 +294,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--repeat")) opt_repeat = 1;
         else if (!strcmp(argv[i], "--terse")) opt_terse = 1;
         else if (!strcmp(argv[i], "--hist")) opt_hist = 1;
+        else if (!strcmp(argv[i], "--ids")) opt_ids = 1;
         else { fprintf(stderr, "opzione sconosciuta: %s\n", argv[i]); return 2; }
     }
 
@@ -330,6 +390,8 @@ int main(int argc, char **argv) {
     } else {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, opt_secs, false);
     }
+
+    if (opt_ids) { ids_flush(); printf("\n"); }
 
     printf("\n=== Lunghezze ricevute ===\n");
     if (g_nbuckets == 0) {
