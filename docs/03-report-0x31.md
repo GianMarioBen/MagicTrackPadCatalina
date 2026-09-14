@@ -3,6 +3,31 @@
 Riferimento incrociato: driver Linux `hid-magicmouse.c` + le catture PacketLogger
 decodificate su Catalina.
 
+## Identificazione del dispositivo
+
+Il vendor ID **cambia col transport**, ed e' un errore facile da fare:
+
+| Transport | VendorID | ProductID |
+|---|---|---|
+| USB       | `0x05AC` (1452) — vendor USB di Apple | `0x0324` (804) |
+| Bluetooth | `0x004C` (76) — company identifier Bluetooth | `0x0324` (804) |
+
+Il ProductID e' lo stesso. Quindi il matching IOKit va fatto **sul solo
+ProductID**, verificando il vendor dopo: un dizionario di matching con
+VendorID 0x004C non trova nulla su USB.
+
+Su USB il dispositivo espone inoltre **piu' interfacce** con lo stesso
+VID/PID:
+
+| UsagePage | Usage | cos'e' |
+|---|---|---|
+| `0x01` | `0x02` | mouse di compatibilita' |
+| `0xFF00` | `0x0B` | vendor Apple |
+| `0xFF00` | `0x0D` | vendor Apple, con endpoint di output da 64 byte |
+
+Agganciarsi alla prima che capita significa quasi sempre prendere quella
+sbagliata.
+
 ## Abilitazione
 
 | Transport | Report ID | Payload feature |

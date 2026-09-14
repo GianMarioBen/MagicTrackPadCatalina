@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MT_VENDOR_ID  0x004C
+/* 0x05AC = vendor USB di Apple, 0x004C = company id Bluetooth. */
+#define MT_VENDOR_USB 0x05AC
+#define MT_VENDOR_BT  0x004C
 #define MT_PRODUCT_ID 0x0324
 
 static int g_all = 0, g_hex_only = 0;
@@ -41,7 +43,8 @@ static void dump_device(IOHIDDeviceRef dev) {
     long vid = int_prop(dev, CFSTR(kIOHIDVendorIDKey));
     long pid = int_prop(dev, CFSTR(kIOHIDProductIDKey));
 
-    if (!g_all && !(vid == MT_VENDOR_ID && pid == MT_PRODUCT_ID)) return;
+    if (!g_all && !(pid == MT_PRODUCT_ID &&
+                    (vid == MT_VENDOR_USB || vid == MT_VENDOR_BT))) return;
 
     char product[256], transport[64];
     str_prop(dev, CFSTR(kIOHIDProductKey), product, sizeof product);

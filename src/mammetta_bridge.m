@@ -26,7 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MT_VENDOR_ID   0x004C
+/* Il vendor ID cambia col transport: 0x05AC e' il vendor USB di Apple,
+ * 0x004C e' il company identifier Bluetooth. Stesso dispositivo, numeri
+ * diversi — quindi si fa il matching sul solo ProductID e si verifica
+ * il vendor dopo. */
+#define MT_VENDOR_USB  0x05AC
+#define MT_VENDOR_BT   0x004C
 #define MT_PRODUCT_ID  0x0324
 
 #define BT_REPORT_ID   0x31
@@ -467,6 +472,13 @@ static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
     return out;
 }
 
+/* Accetta il dispositivo solo se il vendor e' quello USB o quello Bluetooth
+ * di Apple: il matching e' sul ProductID, che da solo non basta. */
+static int is_magic_trackpad(IOHIDDeviceRef dev) {
+    long vid = int_prop(dev, CFSTR(kIOHIDVendorIDKey));
+    return vid == MT_VENDOR_USB || vid == MT_VENDOR_BT;
+}
+
 static int is_bluetooth(IOHIDDeviceRef dev) {
     CFTypeRef v = IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDTransportKey));
     if (!v || CFGetTypeID(v) != CFStringGetTypeID()) return 1;
@@ -490,6 +502,7 @@ static void enable_multitouch(IOHIDDeviceRef dev) {
 
 static void on_match(void *ctx, IOReturn r, void *sender, IOHIDDeviceRef dev) {
     (void)ctx; (void)r; (void)sender;
+    if (!is_magic_trackpad(dev)) return;
 
     long maxIn = int_prop(dev, CFSTR(kIOHIDMaxInputReportSizeKey));
     printf("Trackpad collegato (%s)\n", is_bluetooth(dev) ? "Bluetooth" : "USB");
@@ -571,13 +584,11 @@ int main(int argc, char **argv) {
     CFMutableDictionaryRef m = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    int vid = MT_VENDOR_ID, pid = MT_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+    int pid = MT_PRODUCT_ID;
     CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
-    CFDictionarySetValue(m, CFSTR(kIOHIDVendorIDKey), nv);
     CFDictionarySetValue(m, CFSTR(kIOHIDProductIDKey), np);
     IOHIDManagerSetDeviceMatching(mgr, m);
-    CFRelease(nv); CFRelease(np); CFRelease(m);
+    CFRelease(np); CFRelease(m);
 
     IOHIDManagerRegisterDeviceMatchingCallback(mgr, on_match, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(mgr, on_remove, NULL);
@@ -594,7 +605,7 @@ int main(int argc, char **argv) {
 
     cursor_sync();
     printf("mammetta_bridge — in attesa della Magic Trackpad USB-C "
-           "(VID 0x%04X PID 0x%04X)\n", MT_VENDOR_ID, MT_PRODUCT_ID);
+           "(PID 0x%04X)\n", MT_PRODUCT_ID);
     printf("Ctrl-C per uscire.\n\n");
     fflush(stdout);
 

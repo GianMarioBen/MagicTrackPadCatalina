@@ -23,7 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MT_VENDOR_ID   0x004C
+/* Il vendor ID cambia col transport: 0x05AC e' il vendor USB di Apple,
+ * 0x004C e' il company identifier Bluetooth. Stesso dispositivo, numeri
+ * diversi — quindi si fa il matching sul solo ProductID e si verifica
+ * il vendor dopo. */
+#define MT_VENDOR_USB  0x05AC
+#define MT_VENDOR_BT   0x004C
 #define MT_PRODUCT_ID  0x0324
 #define MAX_IFACES     32
 #define BUF_SIZE       4096
@@ -59,6 +64,13 @@ static long int_prop(IOHIDDeviceRef d, CFStringRef key) {
     if (v && CFGetTypeID(v) == CFNumberGetTypeID())
         CFNumberGetValue((CFNumberRef)v, kCFNumberLongType, &out);
     return out;
+}
+
+/* Accetta il dispositivo solo se il vendor e' quello USB o quello Bluetooth
+ * di Apple: il matching e' sul ProductID, che da solo non basta. */
+static int is_magic_trackpad(IOHIDDeviceRef dev) {
+    long vid = int_prop(dev, CFSTR(kIOHIDVendorIDKey));
+    return vid == MT_VENDOR_USB || vid == MT_VENDOR_BT;
 }
 
 static int is_bluetooth(IOHIDDeviceRef dev) {
@@ -130,6 +142,7 @@ static void on_report(void *ctx, IOReturn res, void *sender,
 static void on_match(void *ctx, IOReturn r, void *sender, IOHIDDeviceRef dev) {
     (void)ctx; (void)r; (void)sender;
     if (g_nif >= MAX_IFACES) return;
+    if (!is_magic_trackpad(dev)) return;
 
     Iface *f = &g_if[g_nif];
     memset(f, 0, sizeof *f);
@@ -178,13 +191,11 @@ int main(int argc, char **argv) {
     CFMutableDictionaryRef m = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    int vid = MT_VENDOR_ID, pid = MT_PRODUCT_ID;
-    CFNumberRef nv = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+    int pid = MT_PRODUCT_ID;
     CFNumberRef np = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
-    CFDictionarySetValue(m, CFSTR(kIOHIDVendorIDKey), nv);
     CFDictionarySetValue(m, CFSTR(kIOHIDProductIDKey), np);
     IOHIDManagerSetDeviceMatching(mgr, m);
-    CFRelease(nv); CFRelease(np); CFRelease(m);
+    CFRelease(np); CFRelease(m);
 
     IOHIDManagerRegisterDeviceMatchingCallback(mgr, on_match, NULL);
     IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(),
@@ -201,8 +212,9 @@ int main(int argc, char **argv) {
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
 
     if (g_nif == 0) {
-        printf("Nessuna interfaccia trovata per VID 0x%04X PID 0x%04X.\n",
-               MT_VENDOR_ID, MT_PRODUCT_ID);
+        printf("Nessuna interfaccia trovata per PID 0x%04X "
+               "(vendor atteso 0x%04X su USB, 0x%04X su Bluetooth).\n",
+               MT_PRODUCT_ID, MT_VENDOR_USB, MT_VENDOR_BT);
         return 1;
     }
 
