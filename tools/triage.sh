@@ -13,7 +13,8 @@ echo
 echo "=== Istanze IOHIDDevice con ProductID 804 (0x0324) ==="
 # ioreg -a produce XML: lo attraversiamo con python invece di fare a pezzi
 # del testo con grep, che sui nodi annidati sbaglia facilmente.
-/usr/bin/python3 - "$PID_DEC" <<'PY'
+PY3=$(command -v python3 || echo /usr/bin/python3)
+"$PY3" - "$PID_DEC" <<'PY'
 import plistlib, subprocess, sys
 
 pid_wanted = int(sys.argv[1])
