@@ -24,6 +24,14 @@ nessun bridge, SIP attivo.
 
 Procedura completa e ripristino: [`docs/07-travestimento.md`](docs/07-travestimento.md).
 
+**Confermato funzionante anche su macOS High Sierra 10.13.6 (17G14042)**, con
+lo stesso identico dispositivo, la stessa procedura, SIP sempre attivo. La
+struttura della cache Bluetooth su 10.13.6 è risultata praticamente identica
+a quella di Catalina — stesso archivio annidato, stesso punto dove si nasconde
+il ProductID. Il Magic Trackpad 2 Lightning richiede solo macOS 10.11 (El
+Capitan) o successivo, quindi il driver nativo è disponibile su qualunque
+versione da lì in poi.
+
 ## Il resto del repo
 
 Tutto quello che c'e' oltre a questo e' il percorso fatto per arrivarci, e
